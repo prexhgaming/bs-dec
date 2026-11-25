@@ -24,8 +24,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 try:
     from elftools.elf.elffile import ELFFile
-    from elftools.elf.sections import SymbolTableSection
-    from elftools.elf.relocation import RelocationSection   # <-- moved here
+    from elftools.elf.sections import SymbolTableSection, RelocationSection
     from capstone import (
         Cs, CS_ARCH_X86, CS_ARCH_ARM, CS_ARCH_ARM64,
         CS_MODE_32, CS_MODE_64, CS_MODE_ARM, CS_MODE_THUMB,
@@ -35,11 +34,11 @@ try:
     from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_REG, ARM64_OP_MEM
     from capstone.x86 import X86_OP_IMM, X86_OP_REG, X86_OP_MEM
 except ImportError as exc:
-    # Show the real failure. If a submodule/symbol is missing, that is a version
-    # or install-path problem, not a "package not installed" problem.
-    print(f"Import failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-    print("Reproduce with: python3 -c 'import <failing_module>'", file=sys.stderr)
-    raise SystemExit(2)
+    # Do not hide the actual failing import: an installed package can still have
+    # a missing/incompatible submodule or native extension (common on Android).
+    print(f"Dependency import failed: {exc!r}", file=sys.stderr)
+    print("Check with: python3 -c 'import elftools, capstone; print(elftools.__file__); print(capstone.__file__)'", file=sys.stderr)
+    raise SystemExit(2) from exc
 
 PYRUN_NAMES = {
     "PyRun_StringFlags": 120,
