@@ -6,7 +6,7 @@ on:
   push:
     paths:
       - "pyrun_locator.py"
-      - "libgame.so"
+      - "libGame.so"
       - ".github/workflows/pyrun.yml"
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
       
       - name: Analyze library
         run: |
-          python pyrun_locator.py libgame.so \
+          python pyrun_locator.py libGame.so \
             --window 45 \
             --max-candidates 50 \
             --entropy \
