@@ -353,7 +353,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elf = target.elf
     log(
         f"{target.label}: {elf.machine} {elf.bits}-bit, "
-        f"{'stripped' if elf.stripped else 'symbols present'}, {len(target.data)} bytes"
+        f"{'symbols present' if elf.has_symtab else 'stripped'}, {len(target.data)} bytes"
     )
 
     starts = sp.enumerate_functions(elf)
@@ -422,7 +422,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "elf": {
             "machine": elf.machine,
             "bits": elf.bits,
-            "stripped": elf.stripped,
+            "stripped": not elf.has_symtab,
             "sections": len(elf.sections),
             "exec_sections": [s.name for s in elf.exec_sections()],
         },
