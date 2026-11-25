@@ -362,15 +362,20 @@ def decode_analysis(img: ELFImage, window: int = 28):
     py_clue_strings = [(va, s.decode("utf-8","replace")) for va, s in img.strings
                        if any(c.lower() in s.lower() for c in PYTHON_CLUES)]
 
+    DISASM_CHUNK = 1 << 16          # 64 KiB windows — capstone never sees the full 52 MB
     for base, code, secname in img.executable:
         log(f"[*] disassembling {secname} @ 0x{base:x} ({len(code)} bytes)")
-        insns = []
+        insns = []; remaining = len(code); off = 0; section_insns = 0
         try:
-            for ins in md.disasm(code, base):
-                insns.append(ins)
-                if len(insns) >= MAX_INSTRUCTIONS_PER_SECTION:
-                    log(f"    [warn] instruction cap reached at 0x{ins.address:x}")
-                    break
+            while remaining > 0 and section_insns < MAX_INSTRUCTIONS_PER_SECTION:
+                chunk = code[off:off + DISASM_CHUNK]
+                for ins in md.disasm(chunk, base + off):
+                    insns.append(ins); section_insns += 1
+                    if section_insns >= MAX_INSTRUCTIONS_PER_SECTION:
+                        log(f"    [warn] instruction cap reached at 0x{ins.address:x}")
+                        break
+                off += len(chunk); remaining -= len(chunk)
+                if remaining <= 0: break
         except Exception as e:
             log(f"    [warn] disasm error: {e!r}")
         total_insns += len(insns)
