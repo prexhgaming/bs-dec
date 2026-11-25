@@ -45,3 +45,4 @@ URL -> file. Tokens/URLs are short lived: resolve fresh every run, never cache.
 - The APKCombo build can differ from the one installed on a device, so lib
   comparisons must report a mismatch instead of failing the job.
 - Shell heredocs are blocked in this sandbox; use write_file for scripts.
+- `Elf.machine` is the numeric e_machine (40), not a name: use `elf.machine_name` / `machine_name(elf)` before handing it to capstone.

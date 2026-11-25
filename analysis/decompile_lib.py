@@ -78,7 +78,7 @@ def load_target(path: Path, *, abi: str = "", member: str = "") -> Target:
         raise SystemExit(f"no such file: {path}")
     if path.suffix.lower() in APK_SUFFIXES:
         with zipfile.ZipFile(path) as archive:
-            name = member or pick_member(archive.namelist(), abi)
+            name = pick_member(archive.namelist(), abi, member)
             if not name:
                 raise SystemExit(
                     f"{path.name} has no lib for ABI '{abi or 'any'}'; "
@@ -103,21 +103,40 @@ def guess_abis(names: Iterable[str]) -> List[str]:
     return sorted(found)
 
 
-def pick_member(names: Sequence[str], abi: str) -> Optional[str]:
-    """Prefer ``lib/<abi>/*.so``; accept a bare member name too."""
+def pick_member(names: Sequence[str], abi: str, wanted: str = "") -> Optional[str]:
+    """Pick ``lib/<abi>/<wanted>`` from an archive; ``wanted`` may be bare or full."""
     candidates = [n for n in names if n.lower().endswith(".so")]
     if not candidates:
         return None
+    if wanted:
+        target = wanted.replace("\\", "/").lower()
+        base = target.rsplit("/", 1)[-1]
+        for name in candidates:  # exact member path first
+            if name.replace("\\", "/").lower() == target:
+                return name
+        for name in candidates:  # then the same file name under any ABI directory
+            if name.replace("\\", "/").lower().rsplit("/", 1)[-1] == base:
+                if not abi or f"/{abi.lower()}/" in name.lower():
+                    return name
+        for name in candidates:  # finally accept the bare name anywhere
+            if name.replace("\\", "/").lower().rsplit("/", 1)[-1] == base:
+                return name
+        return None
     if abi:
-        wanted = abi.lower()
+        wanted_abi = abi.lower()
         for name in candidates:
-            if name.lower().startswith(f"lib/{wanted}/"):
+            if name.lower().startswith(f"lib/{wanted_abi}/"):
                 return name
         return None
     for name in candidates:
         if name.lower().startswith("lib/"):
             return name
     return candidates[0]
+
+
+def machine_name(elf: sp.Elf) -> str:
+    """The ELF machine as a name; ``Elf.machine`` is the numeric e_machine."""
+    return getattr(elf, "machine_name", None) or sp.MACHINES.get(elf.machine, str(elf.machine))
 
 
 # --------------------------------------------------------------- disassembly
@@ -136,8 +155,10 @@ def capstone_module():
     return capstone
 
 
-def build_disassembler(capstone, machine: str, *, thumb: bool):
+def build_disassembler(capstone, machine, *, thumb: bool):
     """Return a capstone ``Cs`` for the ELF machine, or raise SystemExit(3)."""
+    if not isinstance(machine, str):  # tolerate a raw e_machine number
+        machine = sp.MACHINES.get(machine, str(machine))
     if machine == "ARM":
         mode = capstone.CS_MODE_THUMB if thumb else capstone.CS_MODE_ARM
         return capstone.Cs(capstone.CS_ARCH_ARM, mode | capstone.CS_MODE_LITTLE_ENDIAN)
@@ -184,7 +205,8 @@ def function_windows(
 
 def choose_mode(capstone, elf: sp.Elf, addr: int, offset: int, forced: str) -> Tuple[bool, str]:
     """Pick ARM vs Thumb for a 32-bit function; ``forced`` is auto/thumb/arm."""
-    if elf.machine != "ARM":
+    machine = machine_name(elf)
+    if machine != "ARM":
         return False, "arm" if elf.bits == 32 else "a64"
     if forced == "thumb":
         return True, "thumb"
@@ -193,7 +215,7 @@ def choose_mode(capstone, elf: sp.Elf, addr: int, offset: int, forced: str) -> T
     # auto: Thumb-2 is the norm on Android, but verify the first instruction decodes
     probe = elf.data[offset : offset + 16]
     for thumb in (True, False):
-        cs = build_disassembler(capstone, elf.machine, thumb=thumb)
+        cs = build_disassembler(capstone, machine, thumb=thumb)
         decoded = list(cs.disasm(probe, addr))
         if decoded:
             return thumb, "thumb" if thumb else "arm"
@@ -212,7 +234,7 @@ def disassemble_function(
 ) -> Tuple[Dict[str, object], List[str]]:
     """Disassemble one function window into a record plus printable lines."""
     thumb, mode = choose_mode(capstone, elf, addr, offset, forced_mode)
-    cs = build_disassembler(capstone, elf.machine, thumb=thumb)
+    cs = build_disassembler(capstone, machine_name(elf), thumb=thumb)
     cs.detail = False
     code = elf.data[offset : offset + size]
     instructions: List[Dict[str, str]] = []
@@ -352,7 +374,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     elf = target.elf
     log(
-        f"{target.label}: {elf.machine} {elf.bits}-bit, "
+        f"{target.label}: {machine_name(elf)} {elf.bits}-bit, "
         f"{'symbols present' if elf.has_symtab else 'stripped'}, {len(target.data)} bytes"
     )
 

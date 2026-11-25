@@ -144,13 +144,14 @@ jobs:
         if: inputs.engine == 'capstone'
         env:
           ABI: ${{ inputs.abi }}
+          SO: ${{ inputs.so_name }}
           MAX_FN: ${{ inputs.max_functions }}
           MAX_INSN: ${{ inputs.max_instructions }}
           SPLIT: ${{ inputs.split_mb }}
           TEXT: ${{ inputs.text_listing }}
         run: |
           set -o pipefail
-          args=( "${{ steps.archive.outputs.path }}" --abi "$ABI" --out decompiled
+          args=( "${{ steps.archive.outputs.path }}" --abi "$ABI" --member "lib/$ABI/$SO" --out decompiled
                  --max-functions "$MAX_FN" --max-instructions "$MAX_INSN" --split-mb "$SPLIT" )
           [ "$TEXT" = "true" ] && args+=( --text )
           python analysis/decompile_lib.py "${args[@]}" 2>&1 | tee decompile.log
@@ -159,11 +160,12 @@ jobs:
         if: inputs.engine == 'ghidra'
         env:
           ABI: ${{ inputs.abi }}
+          SO: ${{ inputs.so_name }}
           MAX_FN: ${{ inputs.max_functions }}
         run: |
           set -o pipefail
           mkdir -p /tmp/ghidra-lib /tmp/ghidra-out
-          member=$(python -c "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); print([n for n in z.namelist() if n.startswith('lib/' + sys.argv[2] + '/')][0])" "${{ steps.archive.outputs.path }}" "$ABI")
+          member=$(python -c "import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); want='lib/%s/%s' % (sys.argv[2], sys.argv[3]); print(want if want in z.namelist() else [n for n in z.namelist() if n.startswith('lib/%s/' % sys.argv[2]) and n.endswith('/'+sys.argv[3])][0])" "${{ steps.archive.outputs.path }}" "$ABI" "$SO")
           echo "extracting $member"
           python -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extract(sys.argv[2], '/tmp/ghidra-lib')" "${{ steps.archive.outputs.path }}" "$member"
           "$GHIDRA_HOME/support/analyzeHeadless" /tmp/ghidra-project bloodstrike \
@@ -185,11 +187,14 @@ jobs:
             echo "engine=ghidra on hosted runners."
             exit 1
           fi
-          mkdir -p /tmp/ida-out decompiled
+          mkdir -p /tmp/ida-out decompiled /tmp/ida-lib
+          python -c "import sys,zipfile; a=zipfile.ZipFile(sys.argv[1]); a.extract('lib/%s/%s' % (sys.argv[2], sys.argv[3]), '/tmp/ida-lib')" \
+            "${{ steps.archive.outputs.path }}" "${{ inputs.abi }}" "${{ inputs.so_name }}"
+          SO_PATH="/tmp/ida-lib/lib/${{ inputs.abi }}/${{ inputs.so_name }}"
           idat64 -A -S"analysis/ida/decompile_all.py /tmp/ida-out ${{ inputs.max_functions }} 14400" \
-            "lib/${{ inputs.abi }}/${{ inputs.so_name }}" 2>&1 | tee decompile.log || \
+            "$SO_PATH" 2>&1 | tee decompile.log || \
           idat -A -S"analysis/ida/decompile_all.py /tmp/ida-out ${{ inputs.max_functions }} 14400" \
-            "lib/${{ inputs.abi }}/${{ inputs.so_name }}" 2>&1 | tee decompile.log
+            "$SO_PATH" 2>&1 | tee decompile.log
           gzip -9 -c /tmp/ida-out/decompiled.c > decompiled/decompiled.c.gz
           cp /tmp/ida-out/ida-manifest.json decompiled/
 
