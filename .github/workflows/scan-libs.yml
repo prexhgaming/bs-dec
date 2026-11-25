@@ -1,8 +1,11 @@
 name: Scan native libs for pyrun entry points
 
 # Downloads the whole APK in the runner (no ranged payload reads, so a partial
-# transfer can never fake a scan result), extracts lib/<abi>/libGame.so from the
-# archive with zipfile (CRC-checked), and runs the pyrun scanner over every ABI.
+# transfer can never fake a scan result), reads lib/<abi>/libGame.so out of the
+# archive with zipfile (CRC-checked), and scans every requested ABI with
+# analysis/scan_pyrun.py. Optionally matches functions against a local library
+# fetched from a URL, which is how a build from a device can be compared with
+# the one the mirror ships.
 
 on:
   workflow_dispatch:
@@ -31,6 +34,14 @@ on:
         description: Fail unless these ABIs exist in the archive (empty to skip)
         required: false
         default: arm64-v8a,armeabi-v7a
+      expect_version:
+        description: Fail unless the page offers this version (empty to skip)
+        required: false
+        default: ""
+      match_url:
+        description: Optional URL of a local .so to match functions against (empty to skip)
+        required: false
+        default: ""
   push:
     branches: [main]
     paths:
@@ -54,6 +65,8 @@ jobs:
       ABIS: ${{ inputs.abis || 'armeabi-v7a,arm64-v8a' }}
       SO_NAME: ${{ inputs.so_name || 'libGame.so' }}
       REQUIRE_ABI: ${{ inputs.require_abi || '' }}
+      EXPECT_VERSION: ${{ inputs.expect_version || '' }}
+      MATCH_URL: ${{ inputs.match_url || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -70,7 +83,8 @@ jobs:
       - name: Show inputs
         run: |
           echo "package=$PACKAGE slug=$SLUG variant=$VARIANT abis=$ABIS so=$SO_NAME"
-          echo "require_abi=${REQUIRE_ABI:-<none>}"
+          echo "require_abi=${REQUIRE_ABI:-<none>} expect_version=${EXPECT_VERSION:-<any>}"
+          echo "match_url=${MATCH_URL:-<none>}"
 
       - name: Compile check
         run: python -m compileall -q apkcombo analysis fetch_apk.py
@@ -81,6 +95,9 @@ jobs:
           ARGS=(-p "$PACKAGE" --slug "$SLUG" --variant "$VARIANT" --mode download --out-dir downloads)
           if [ -n "$REQUIRE_ABI" ]; then
             ARGS+=(--detect-abis --require-abi "$REQUIRE_ABI")
+          fi
+          if [ -n "$EXPECT_VERSION" ]; then
+            ARGS+=(--expect-version "$EXPECT_VERSION")
           fi
           echo "python fetch_apk.py ${ARGS[*]}"
           python fetch_apk.py "${ARGS[@]}" 2>&1 | tee download.log
@@ -99,6 +116,14 @@ jobs:
           ls -l "$FILE"
           sha256sum "$FILE" | tee downloads/SHA256SUMS.txt
 
+      - name: Fetch the local library for matching
+        if: inputs.match_url != ''
+        run: |
+          mkdir -p local
+          curl -fL --retry 3 --retry-delay 2 -o "local/local-lib.so" "$MATCH_URL"
+          ls -l local/local-lib.so
+          python analysis/scan_pyrun.py local/local-lib.so --quiet 2>&1 | tee local/info.txt
+
       - name: Scan each ABI
         run: |
           set -o pipefail
@@ -108,10 +133,14 @@ jobs:
           for ABI in "${LIST[@]}"; do
             ABI="$(echo "$ABI" | xargs)"
             [ -z "$ABI" ] && continue
+            ARGS=("${{ steps.archive.outputs.path }}" --abi "$ABI" --so-name "$SO_NAME"
+                  --json "reports/pyrun-${ABI}.json"
+                  --dump-functions "reports/functions-${ABI}.txt")
+            if [ -f local/local-lib.so ]; then
+              ARGS+=(--match-lib local/local-lib.so --match-abi "$ABI" --match-limit 100)
+            fi
             echo "::group::scan $ABI"
-            python analysis/scan_pyrun.py "${{ steps.archive.outputs.path }}" \
-              --abi "$ABI" --so-name "$SO_NAME" \
-              --json "reports/pyrun-${ABI}.json" 2>&1 | tee "reports/pyrun-${ABI}.txt" || STATUS=$?
+            python analysis/scan_pyrun.py "${ARGS[@]}" 2>&1 | tee "reports/pyrun-${ABI}.txt" || STATUS=$?
             echo "::endgroup::"
           done
           {
@@ -136,6 +165,7 @@ jobs:
           name: pyrun-scan
           path: |
             reports/
+            local/
             download.log
             downloads/SHA256SUMS.txt
           if-no-files-found: warn

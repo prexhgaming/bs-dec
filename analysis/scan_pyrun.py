@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import struct
 import sys
 import zipfile
@@ -45,6 +46,48 @@ SHF_EXECINSTR = 0x4
 
 MACHINES = {3: "x86", 8: "MIPS", 40: "ARM", 62: "x86-64", 183: "AArch64", 243: "RISC-V"}
 NEEDLES = (b"PyRun_", b"pyrun_", b"PyRun_String", b"pyrun_String")
+
+# Broader evidence table. A build can embed CPython without ever keeping a
+# ``PyRun_`` literal (the symbol is stripped and the string may be gone), so the
+# report counts every marker family that would prove the interpreter is inside.
+MARKERS: Tuple[Tuple[str, bytes], ...] = (
+    ("PyRun_ (pythonrun)", b"PyRun_"),
+    ("pyrun_", b"pyrun_"),
+    ("PyRun_StringFlags", b"PyRun_StringFlags"),
+    ("Py_Initialize", b"Py_Initialize"),
+    ("PyEval_", b"PyEval_"),
+    ("PyImport_", b"PyImport_"),
+    ("PyObject_", b"PyObject_"),
+    ("PyGILState_", b"PyGILState_"),
+    ("Py_BuildValue", b"Py_BuildValue"),
+    ("PyArg_Parse", b"PyArg_Parse"),
+    ("PyModule_", b"PyModule_"),
+    ("libpython", b"libpython"),
+    ("python3.", b"python3."),
+    ("JNI_OnLoad", b"JNI_OnLoad"),
+    ("il2cpp", b"il2cpp"),
+    ("UnityPlayer", b"UnityPlayer"),
+    ("mono_", b"mono_"),
+    ("lua_State", b"lua_State"),
+    ("Lua 5", b"Lua 5"),
+)
+
+# Section names that betray a protector/packer: code is encrypted at rest, so a
+# string or symbol search cannot see anything until it is unpacked at runtime.
+PACKER_HINTS = (
+    "upx",
+    "execv3",
+    "secneo",
+    "libnesec",
+    "bangcle",
+    "ijiami",
+    "jiagu",
+    "360",
+    "tencent",
+    "stub",
+    "packed",
+    "encrypt",
+)
 
 try:  # optional dependency: pass 3 only
     import capstone  # type: ignore
@@ -534,6 +577,11 @@ def analyse(data: bytes, label: str) -> Dict[str, object]:
     strings = scan_strings(elf)
     references = scan_references(elf, strings)
     named = scan_symbols(elf)
+    sections = section_inventory(elf)
+    imports = scan_imports(elf)
+    markers = scan_markers(data)
+    needed = scan_needed(elf)
+    executables = enumerate_functions(elf)
     return {
         "file": label,
         "size": len(data),
@@ -544,17 +592,33 @@ def analyse(data: bytes, label: str) -> Dict[str, object]:
             "stripped": not elf.has_symtab,
             "sections": len(elf.sections),
             "executable_sections": [section.name for section in elf.exec_sections()],
+            "function_candidates": len(executables),
         },
         "capstone": None if capstone is None else getattr(capstone, "__version__", "present"),
+        "linking": needed,
+        "imports": {"count": len(imports), "names": imports[:200]},
+        "sections": sections,
+        "protection": protection_notes(elf, sections),
+        "markers": markers,
         "symbols": named,
         "strings": [hit.as_dict() for hit in strings],
         "references": [reference.as_dict() for reference in references],
-        "summary": _summary(named, strings, references),
+        "summary": _summary(named, strings, references, markers, imports, needed, sections),
     }
 
 
-def _summary(named, strings, references) -> Dict[str, object]:
+def _summary(named, strings, references, markers, imports, needed, sections) -> Dict[str, object]:
     named_functions = [item for item in named if item["kind"] == "function"]
+    present = [row["marker"] for row in markers if row["count"]]
+    python_markers = [
+        row["marker"]
+        for row in markers
+        if row["count"] and str(row["marker"]).startswith(("Py", "pyrun", "libpython", "python3"))
+    ]
+    high_entropy = [
+        row["name"] for row in sections
+        if row["executable"] and float(row["entropy"]) >= ENTROPY_PACKED
+    ]
     return {
         "named_symbols": len(named),
         "named_functions": len(named_functions),
@@ -562,18 +626,240 @@ def _summary(named, strings, references) -> Dict[str, object]:
         "strings": len(strings),
         "code_references": len(references),
         "method_names_found": sorted({str(item["name"]) for item in named_functions}),
-        "verdict": _verdict(named, references),
+        "markers_present": present,
+        "python_markers": python_markers,
+        "total_imports": len(imports),
+        "needed_libraries": list(needed.get("needed", [])),
+        "high_entropy_code": high_entropy,
+        "verdict": _verdict(named, references, present, imports, needed, high_entropy),
     }
 
 
-def _verdict(named, references) -> str:
+def _verdict(named, references, present, imports, needed, high_entropy) -> str:
     if any(item["kind"] == "function" for item in named):
         return "method names present in the symbol table"
     if references:
         return "stripped, but pyrun strings are referenced from code"
+    if high_entropy and not present:
+        return ("no traces, and executable sections look packed/encrypted "
+                f"({', '.join(high_entropy)}): unpack before scanning")
+    if any("python" in str(row).lower() or str(row).startswith(("Py", "pyrun")) for row in present):
+        return "CPython strings present but no PyRun_ entry point found"
+    needed_libs = [str(name) for name in needed.get("needed", [])]
+    if any("python" in name.lower() for name in needed_libs):
+        return "libpython is linked, but the PyRun_ symbol was stripped"
+    if imports:
+        return f"no CPython evidence: {len(imports)} imports, none from libpython"
+    return "no pyrun traces found (and no dynamic imports to cross-check)"
+
+
+# ---------------------------------------------------------------- evidence
+
+
+def scan_markers(data: bytes, limit: int = 0) -> List[Dict[str, object]]:
+    """Count every interesting marker family, whether or not it is a pyrun one."""
+    rows: List[Dict[str, object]] = []
+    for label, needle in MARKERS:
+        count = data.count(needle)
+        if count:
+            sample = _printable_at(data, data.find(needle), limit=limit or 72)
+        else:
+            sample = None
+        rows.append({"marker": label, "needle": needle.decode("ascii", "replace"),
+                     "count": count, "sample": sample})
+    return rows
+
+
+def scan_imports(elf: Elf) -> List[str]:
+    """Every undefined dynamic symbol, i.e. what the library imports."""
+    names = {symbol.name for symbol in elf.symbols if symbol.is_import}
+    return sorted(names)
+
+
+def scan_needed(elf: Elf) -> Dict[str, object]:
+    """DT_NEEDED / SONAME / RUNPATH: what the loader links this library against."""
+    dynamic = next((s for s in elf.sections if s.name == ".dynamic" or s.type == 6), None)
+    result: Dict[str, object] = {"needed": [], "soname": None, "rpath": None}
+    if dynamic is None or dynamic.size == 0:
+        return result
+    # .dynamic entries point into .dynstr, which the section's sh_link names
+    strtab = elf.sections[dynamic.link] if dynamic.link < len(elf.sections) else None
+    strings = (
+        elf.data[strtab.offset : strtab.offset + strtab.size] if strtab is not None else b""
+    )
+    step = 16 if elf.bits == 64 else 8
+    fmt = "<qQ" if elf.bits == 64 else "<iI"
+    needed: List[str] = []
+    for offset in range(dynamic.offset, dynamic.offset + dynamic.size, step):
+        if offset + step > len(elf.data):
+            break
+        tag, value = struct.unpack_from(fmt, elf.data, offset)
+        if tag == 0:  # DT_NULL
+            break
+        if tag == 1:  # DT_NEEDED
+            name = _cstring(strings, value)
+            if name:
+                needed.append(name)
+        elif tag == 14:  # DT_SONAME
+            result["soname"] = _cstring(strings, value) or None
+        elif tag in (15, 29):  # DT_RPATH / DT_RUNPATH
+            result["rpath"] = _cstring(strings, value) or None
+    result["needed"] = needed
+    return result
+
+
+def _entropy(blob: bytes, sample: int = 1 << 20) -> float:
+    if not blob:
+        return 0.0
+    chunk = blob[:sample]
+    counts = [0] * 256
+    for byte in chunk:
+        counts[byte] += 1
+    total = len(chunk)
+    entropy = 0.0
+    for count in counts:
+        if count:
+            p = count / total
+            entropy -= p * math.log2(p)
+    return round(entropy, 3)
+
+
+def section_inventory(elf: Elf) -> List[Dict[str, object]]:
+    """Name/type/size/entropy per section — high entropy in .text means packed."""
+    rows: List[Dict[str, object]] = []
+    for section in elf.sections:
+        if not section.name or section.type == SHT_NOBITS or not section.size:
+            continue
+        blob = elf.data[section.offset : section.offset + min(section.size, 1 << 20)]
+        rows.append(
+            {
+                "name": section.name,
+                "type": section.type,
+                "size": section.size,
+                "address": f"0x{section.addr:x}",
+                "executable": bool(section.flags & SHF_EXECINSTR),
+                "entropy": _entropy(blob),
+            }
+        )
+    return rows
+
+
+def protection_notes(elf: Elf, sections: Sequence[Dict[str, object]]) -> List[str]:
+    notes: List[str] = []
+    names = " ".join(str(row["name"]).lower() for row in sections)
+    for hint in PACKER_HINTS:
+        if hint in names:
+            notes.append(f"section name mentions '{hint}'")
+    for row in sections:
+        if not row["executable"]:
+            continue
+        entropy = float(row["entropy"])
+        if entropy >= ENTROPY_PACKED:
+            notes.append(f"{row['name']} has entropy {entropy}: encrypted or packed code")
+        elif entropy >= ENTROPY_NOTE:
+            notes.append(
+                f"{row['name']} has entropy {entropy}: normal for dense ARM code, "
+                "but also what a light packer looks like"
+            )
+    if not elf.has_symtab:
+        notes.append("no .symtab: local symbols were stripped before release")
+    return notes
+
+
+# ------------------------------------------------- function inventory / match
+
+
+ENTROPY_NOTE = 7.5   # dense ARM code reaches this; worth mentioning
+ENTROPY_PACKED = 7.85  # encrypted/packed sections sit here
+
+ARM_PUSH_LR = 0xE92D4000
+ARM_PUSH_MASK = 0xFFFF4000
+THUMB_PUSH_LR = 0xB500
+THUMB_PUSH_MASK = 0xFF00
+AARCH64_STP = b"\xfd\x7b"
+
+
+def enumerate_functions(elf: Elf, *, limit: int = 250_000) -> List[int]:
+    """Addresses that look like function entry points, symbols first."""
+    named = [symbol.value for symbol in elf.functions()]
     if named:
-        return "only imports/strings survive; no code reference recovered"
-    return "no pyrun traces found"
+        return sorted(set(named))
+
+    starts: set = set()
+    for section in elf.exec_sections():
+        code = elf.read(section.offset, section.size)
+        base = section.addr
+        if elf.bits == 64:
+            for offset in range(0, len(code) - 4, 4):
+                if code[offset : offset + 2] == AARCH64_STP:
+                    starts.add(base + offset)
+        else:
+            for offset in range(0, len(code) - 4, 4):
+                word = int.from_bytes(code[offset : offset + 4], "little")
+                if (word & ARM_PUSH_MASK) == ARM_PUSH_LR:
+                    starts.add(base + offset)
+            for offset in range(0, len(code) - 2, 2):
+                half = int.from_bytes(code[offset : offset + 2], "little")
+                if (half & THUMB_PUSH_MASK) == THUMB_PUSH_LR and half & 0x0100:
+                    starts.add(base + offset)
+        if len(starts) >= limit:
+            break
+    return sorted(starts)[:limit]
+
+
+def function_fingerprints(
+    elf: Elf, starts: Sequence[int], *, window: int = 96
+) -> Dict[str, List[int]]:
+    """Map ``sha256(first window bytes)`` -> addresses, for cross-build matching."""
+    table: Dict[str, List[int]] = {}
+    for address in starts:
+        offset = elf.vaddr_to_offset(address)
+        if offset is None:
+            continue
+        blob = elf.data[offset : offset + window]
+        if len(blob) < 16:
+            continue
+        digest = hashlib.sha256(blob).hexdigest()
+        table.setdefault(digest, []).append(address)
+    return table
+
+
+def match_functions(
+    left: Elf, right: Elf, *, window: int = 96, limit: int = 50
+) -> Dict[str, object]:
+    """Find functions whose leading bytes are identical in both libraries."""
+    left_starts = enumerate_functions(left)
+    right_starts = enumerate_functions(right)
+    right_table = function_fingerprints(right, right_starts, window=window)
+    matches: List[Dict[str, object]] = []
+    for address in left_starts:
+        offset = left.vaddr_to_offset(address)
+        if offset is None:
+            continue
+        blob = left.data[offset : offset + window]
+        if len(blob) < 16:
+            continue
+        digest = hashlib.sha256(blob).hexdigest()
+        for counterpart in right_table.get(digest, []):
+            matches.append(
+                {
+                    "left": f"0x{address:x}",
+                    "right": f"0x{counterpart:x}",
+                    "window": len(blob),
+                    "sha256": digest[:16],
+                }
+            )
+            if len(matches) >= limit:
+                break
+        if len(matches) >= limit:
+            break
+    return {
+        "window": window,
+        "left_functions": len(left_starts),
+        "right_functions": len(right_starts),
+        "identical": len(matches),
+        "matches": matches,
+    }
 
 
 # ------------------------------------------------------------------------- CLI
@@ -584,9 +870,46 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("target", help="an .so file, or an .apk/.xapk to read the member from")
     parser.add_argument("--so-name", default="libGame.so", help="member name inside an archive")
     parser.add_argument("--abi", default="armeabi-v7a", help="lib/<abi>/ member to read from an archive")
+    parser.add_argument("--match-lib", help="second library/archive: report byte-identical functions")
+    parser.add_argument("--match-abi", help="lib/<abi>/ member to read from --match-lib (default: --abi)")
+    parser.add_argument("--match-window", type=int, default=96, help="bytes compared per function")
+    parser.add_argument("--match-limit", type=int, default=50, help="stop after this many matches")
+    parser.add_argument("--dump-functions", help="write every function candidate address here")
     parser.add_argument("--json", dest="json_out", help="write the full report here")
     parser.add_argument("--quiet", action="store_true", help="print only the summary lines")
     return parser
+
+
+def _load(target: Path, so_name: str, abi: str) -> Tuple[bytes, str]:
+    if target.suffix.lower() in (".apk", ".xapk", ".apks", ".aab", ".zip"):
+        return load_from_zip(target, so_name, abi)
+    return target.read_bytes(), target.name
+
+
+def _print_evidence(report: Dict[str, object], quiet: bool) -> None:
+    summary = report["summary"]
+    linking = report["linking"]
+    needed = linking.get("needed") or []
+    print(f"  imports             : {summary['total_imports']}")
+    if needed:
+        print(f"  DT_NEEDED           : {', '.join(str(name) for name in needed)}")
+    interesting = [row for row in report["markers"] if row["count"]]
+    if interesting:
+        print("  markers present     :")
+        for row in interesting[:12]:
+            print(f"      {row['marker']:<24} x{row['count']:<5} {row['sample']!r}")
+    if report["protection"]:
+        print("  protection          :")
+        for note in report["protection"]:
+            print(f"      {note}")
+    if not quiet:
+        rows = sorted(report["sections"], key=lambda row: -row["size"])[:8]
+        print("  sections            :")
+        for row in rows:
+            print(f"      {row['name']:<18} {row['size']:>10} bytes  "
+                  f"entropy {row['entropy']:<6} {'exec' if row['executable'] else ''}")
+        for name in list(report["imports"]["names"])[:15]:
+            print(f"      import {name}")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -597,10 +920,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     try:
-        if target.suffix.lower() in (".apk", ".xapk", ".apks", ".aab", ".zip"):
-            data, label = load_from_zip(target, args.so_name, args.abi)
-        else:
-            data, label = target.read_bytes(), target.name
+        data, label = _load(target, args.so_name, args.abi)
     except (SystemExit, zipfile.BadZipFile) as exc:
         print(str(exc) if isinstance(exc, SystemExit) else f"error: {exc}", file=sys.stderr)
         return 2
@@ -617,13 +937,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary = report["summary"]
     print(f"{label}: {report['elf']['machine']} {report['elf']['bits']}-bit, "
           f"{'stripped' if report['elf']['stripped'] else 'symbols present'}, "
-          f"{report['size']} bytes")
+          f"{report['size']} bytes, {report['elf']['function_candidates']} function candidates")
     print(f"  named pyrun symbols : {summary['named_symbols']} "
-          f"({summary['named_functions']} defined, {summary['imports']} imports)")
+          f"({summary['named_functions']} defined, {summary['imports']} pyrun imports)")
     print(f"  string literals     : {summary['strings']}")
     print(f"  code references     : {summary['code_references']}"
           + ("" if report["capstone"] else " (capstone missing: pass 3 skipped)"))
     print(f"  verdict             : {summary['verdict']}")
+    _print_evidence(report, args.quiet)
 
     if not args.quiet:
         for item in report["symbols"][:20]:
@@ -634,6 +955,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             label_name = function.get("name") or f"sub_{function.get('address')}"
             print(f"    ref @ {reference['insn_address']} ({reference['mode']}) -> "
                   f"{reference['string']!r} in {label_name} [{function.get('source')}]")
+
+    if args.match_lib:
+        try:
+            other_data, other_label = _load(
+                Path(args.match_lib), args.so_name, args.match_abi or args.abi
+            )
+            other = parse_elf(other_data)
+            left = parse_elf(data)
+            result = match_functions(
+                left, other, window=args.match_window, limit=args.match_limit
+            )
+            report["match"] = {"other": other_label, **result}
+            print(f"  match vs {other_label}: {result['identical']} identical function(s) "
+                  f"of {result['left_functions']} vs {result['right_functions']} candidates")
+            for item in result["matches"][:10]:
+                print(f"      {item['left']} == {item['right']} ({item['window']}B, {item['sha256']})")
+        except (ValueError, SystemExit, OSError, zipfile.BadZipFile) as exc:
+            print(f"error: could not compare with {args.match_lib}: {exc}", file=sys.stderr)
+            return 2
+
+    if args.dump_functions:
+        left = parse_elf(data)
+        starts = enumerate_functions(left)
+        Path(args.dump_functions).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.dump_functions, "w", encoding="utf-8") as handle:
+            for address in starts:
+                handle.write(f"0x{address:x}\n")
+        print(f"function candidates written to {args.dump_functions} ({len(starts)} addresses)")
 
     if args.json_out:
         Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)

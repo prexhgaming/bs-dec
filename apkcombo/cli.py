@@ -98,6 +98,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-abi", help="comma separated ABIs the archive must contain (fails if missing)")
     parser.add_argument("--extract-abi", help="after a download, also write the base + that ABI's splits")
     parser.add_argument("--expect-sha256", help="fail unless the downloaded file has this sha256")
+    parser.add_argument(
+        "--expect-version",
+        help="fail unless the page offers this version (e.g. 169 or 1.003.650026)",
+    )
     parser.add_argument("--use-page-sha256", action="store_true", help="verify against the SHA-256 published on the page")
     parser.add_argument("--sample-bytes", type=int, default=DEFAULT_SAMPLE_BYTES, help="bytes to pull in sample mode")
     parser.add_argument("--timeout", type=float, default=http.DEFAULT_TIMEOUT, help="per-request timeout in seconds")
@@ -144,6 +148,16 @@ def run(args, reporter: Reporter) -> int:
         f"{app.size_text or 'unknown size'}"
         + (f", architectures: {', '.join(app.archs)}" if app.archs else "")
     )
+
+    if args.expect_version:
+        wanted = str(args.expect_version).strip()
+        offered = str(app.version or "").strip()
+        if wanted.lower() not in (offered.lower(), offered.lower().replace(".", "")):
+            raise VerificationError(
+                f"APKCombo offers version {offered or 'unknown'}, but version {wanted} was "
+                "expected; the mirror has not published that build (or another slug carries it)"
+            )
+        reporter.note(f"version check: page offers {offered}, as expected")
 
     download_url, variants = pages.fetch_variants(
         app, timeout=args.timeout, retries=args.retries, log=reporter.debug

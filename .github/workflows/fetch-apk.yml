@@ -29,6 +29,10 @@ on:
         description: Comma separated ABIs that must exist inside the file
         required: true
         default: arm64-v8a,armeabi-v7a
+      expect_version:
+        description: Fail unless the APKCombo page offers this version (empty = accept whatever is there)
+        required: false
+        default: ""
       mode:
         description: download = full file, sample = first few MiB only, probe = resolve only
         required: true
@@ -83,6 +87,7 @@ jobs:
           MODE: ${{ inputs.mode }}
           PAGE_SHA: ${{ inputs.verify_page_sha256 }}
           EXTRACT: ${{ inputs.extract_abi }}
+          VERSION: ${{ inputs.expect_version }}
         run: |
           {
             echo "### Request"
@@ -94,6 +99,7 @@ jobs:
             echo "| variant | \`$VARIANT\` |"
             echo "| mode | \`$MODE\` |"
             echo "| required ABIs | \`$ABIS\` |"
+            echo "| expected version | \`${VERSION:-<any>}\` |"
             echo "| verify page sha256 | \`$PAGE_SHA\` |"
             echo "| extract ABI | \`$EXTRACT\` |"
             echo ""
@@ -110,11 +116,13 @@ jobs:
           MODE: ${{ inputs.mode }}
           PAGE_SHA: ${{ inputs.verify_page_sha256 }}
           EXTRACT: ${{ inputs.extract_abi }}
+          VERSION: ${{ inputs.expect_version }}
         run: |
           set -o pipefail
           args=( -p "$PKG" --variant "$VARIANT" --mode "$MODE" --out-dir downloads --detect-abis )
           [ -n "$SLUG" ] && args+=( --slug "$SLUG" )
           [ -n "$ABIS" ] && args+=( --require-abi "$ABIS" )
+          [ -n "$VERSION" ] && args+=( --expect-version "$VERSION" )
           [ "$PAGE_SHA" = "true" ] && args+=( --use-page-sha256 )
           [ -n "$EXTRACT" ] && args+=( --extract-abi "$EXTRACT" )
           echo "\$ python fetch_apk.py ${args[*]}"
