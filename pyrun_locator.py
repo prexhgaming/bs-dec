@@ -504,6 +504,32 @@ def _scan_thumb2(elf: ELF, data: bytes, base: int, scan: CodeScan,
                 scan.calls.append((site, target))
 
 
+def find_pointer_slots(elf: ELF, targets: Set[int], window: int = 32) -> List[Tuple[int, int]]:
+    """Every word in the image that points at (or just before) an anchor VA.
+
+    The window matters: CPython's _Py_DECLARE_STR embeds the literal inside a
+    static PyASCIIObject, so code references the struct base, a few bytes before
+    the string itself.  An exact-match pointer search misses all of those."""
+    allowed: Dict[int, int] = {}
+    for target in targets:
+        for back in range(0, window + 1):
+            allowed[target - back] = target
+
+    hits: List[Tuple[int, int]] = []
+    for seg in elf.segments:
+        if not seg.filesz:
+            continue
+        data = bytes(elf.buf[seg.offset:seg.offset + seg.filesz])
+        words = _words_of(elf, data)
+        base = seg.vaddr
+        get = allowed.get
+        for idx, word in enumerate(words):
+            matched = get(word)
+            if matched is not None:
+                hits.append((base + idx * 4, matched))
+    return hits
+
+
 def collect_xrefs(elf: ELF, targets: Set[int], scan: CodeScan) -> List[Xref]:
     """All references to any anchor VA, from code or from data."""
     xrefs: List[Xref] = []
@@ -516,20 +542,10 @@ def collect_xrefs(elf: ELF, targets: Set[int], scan: CodeScan) -> List[Xref]:
         seen.add(key)
         xrefs.append(Xref(va, target, kind, note))
 
-    # 1. Absolute pointer stored anywhere (literal pool, GOT, .data.rel.ro, vtable).
-    #    C-speed: one bytes.find per (target, word-size) instead of a Python loop.
-    for target in targets:
-        if elf.bits == 32:
-            packers = ((struct.pack("<I", target & 0xFFFFFFFF), 4),)
-        else:
-            packers = ((struct.pack("<Q", target & 0xFFFFFFFFFFFFFFFF), 8),)
-        for needle, size in packers:
-            for off in elf.find_all(needle, limit=64):
-                va = elf.off_to_va(off)
-                if va is None:
-                    continue
-                kind = "literal-pool" if _is_exec(elf, va) else "data-pointer"
-                add(va, target, kind, f"{size}-byte pointer")
+    # 1. Pointer stored anywhere (literal pool, GOT, .data.rel.ro, static PyObject).
+    for slot, target in find_pointer_slots(elf, targets):
+        kind = "literal-pool" if _is_exec(elf, slot) else "data-pointer"
+        add(slot, target, kind, "pointer into anchor window")
 
     # 2. ARM movw/movt pairs (how PIC code materialises a local address).
     pending: Dict[int, Tuple[int, int]] = {}
