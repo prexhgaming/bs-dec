@@ -1,547 +1,917 @@
 #!/usr/bin/env python3
-"""Heuristic locator for CPython PyRun_StringFlags-like call sites in stripped ELF .so files.
+"""Locate CPython's PyRun_StringFlags / _PyRun_String in a stripped, symbol-hidden
+ELF shared object -- without using symbol names.
 
-This is static analysis only. Requires: pip install pyelftools capstone
+Why this rewrite exists
+-----------------------
+The previous version scored call sites by looking up PLT / relocation *symbol names*
+("PyRun_StringFlags", "Py_CompileString", ...).  That is useless against a binary
+whose symbol table is stripped and whose Python runtime is renamed: on libGame.so
+every single one of the 1224 candidates came back with target_symbol == None, so the
+name bonuses (70-120 points) never fired and the ranking degenerated into noise
+(scores 12-18 from generic heuristics alone).
+
+This version anchors on *behaviour and data*, which name obfuscation normally does
+not touch:
+
+  1. CPython emits the literal "invalid start argument" from exactly one place --
+     check_start(), which is inlined into _PyRun_String() and _PyRun_File()
+     (Python/pythonrun.c).  Nothing else in the process references that string.
+  2. _PyRun_String() also materialises the anonymous filename "<string>" and looks
+     up "__name__" in the globals dict.
+  3. check_start() switches on Py_single_input(256) / Py_file_input(257) /
+     Py_eval_input(258).
+  4. PyRun_StringFlags() is the only caller of _PyRun_String() that passes
+     name == NULL (i.e. r1 / x1 == 0 as the 2nd argument).
+
+So: find the literal -> find the code that references it -> that code is
+_PyRun_String -> walk its callers -> the one passing a null 2nd argument is
+PyRun_StringFlags.
+
+Memory
+------
+libGame.so is ~84 MB with a ~52 MB .text.  The old version handed capstone the whole
+section in one disasm() call and retained every instruction object; that is what got
+the process OOM-killed before its own instruction cap could trip.  This version:
+
+  * mmaps the file instead of reading it,
+  * never builds a global string table,
+  * finds references with C-speed bytes.find() rather than Python loops,
+  * only disassembles a few KB around confirmed candidates.
+
+Usage
+-----
+    python pyrun_locator.py libGame.so --json report.json
+    python pyrun_locator.py libGame.so --deep --entropy --json report.json
+
+No third-party dependency is required.  capstone is used opportunistically for the
+final verification disassembly when it happens to be installed.
 """
 from __future__ import annotations
 
-import argparse, json, math, os, re, sys, time
-from collections import Counter
+import argparse
+import json
+import math
+import mmap
+import os
+import struct
+import sys
+import time
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-try:
-    from elftools.elf.elffile import ELFFile
-    from elftools.elf.sections import SymbolTableSection
-    from elftools.elf.relocation import RelocationSection          # FIX 1
-    from capstone import (
-        Cs, CS_ARCH_X86, CS_ARCH_ARM, CS_ARCH_ARM64,
-        CS_MODE_32, CS_MODE_64, CS_MODE_ARM, CS_MODE_THUMB,
-        CS_MODE_LITTLE_ENDIAN, CS_MODE_BIG_ENDIAN,
-    )
-    from capstone.arm import ARM_OP_IMM, ARM_OP_REG, ARM_OP_MEM
-    from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_REG, ARM64_OP_MEM
-    from capstone.x86 import X86_OP_IMM, X86_OP_REG, X86_OP_MEM
-except ImportError as exc:
-    print(f"Dependency import failed: {exc!r}", file=sys.stderr)
-    raise SystemExit(2) from exc
+# --------------------------------------------------------------------------- ELF
+PT_LOAD = 1
+PF_X = 0x1
+SHF_EXECINSTR = 0x4
+EM_ARM, EM_X86_64, EM_AARCH64, EM_386 = 40, 62, 183, 3
 
-PYRUN_NAMES = {
-    "PyRun_StringFlags": 120, "PyRun_String": 110,
-    "PyRun_SimpleStringFlags": 100, "PyRun_SimpleString": 90,
-    "PyRun_FileExFlags": 100, "PyRun_FileFlags": 95,
-    "Py_CompileString": 75, "Py_CompileStringExFlags": 80,
-}
-PYTHON_CLUES = (
-    b"python", b"pyobject", b"pyrun", b"py_eval_input", b"py_file_input",
-    b"marshal", b"bytecode", b"__main__", b"builtins", b"compile", b"eval",
-    b"exec", b"importlib", b"sys.modules", b"Py_Initialize", b"PyErr_",
-)
-DECODE_MNEMONICS = {"xor","eor","add","sub","ror","rol","and","orr","not",
-                    "neg","shl","shr","lsl","lsr","asr","rev","bswap"}
+# CPython start tokens (Include/compile.h)
+MODE_SINGLE, MODE_FILE, MODE_EVAL = 256, 257, 258
+START_MODES = (MODE_SINGLE, MODE_FILE, MODE_EVAL)
 
-MAX_INSTRUCTIONS_PER_SECTION = 1_500_000
-MAX_STRINGS                  = 400_000
-MAX_ENTROPY_BYTES            = 32 * 1024 * 1024   # cap total bytes scanned for entropy
-MAX_STR                   = 5_000_000             # abort if .so text loading is insane
+# How far back to look for a function prologue when mapping an address to a function.
+PROLOGUE_SCAN = 0x1200
+# How far into a candidate function to look for the start-mode switch.
+SWITCH_SCAN = 0x1000
 
-def log(msg: str):
+
+def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
 
 @dataclass
 class Segment:
-    vaddr: int; offset: int; filesz: int; memsz: int; flags: int; data: bytes; name: str = "LOAD"
+    vaddr: int
+    offset: int
+    filesz: int
+    memsz: int
+    flags: int
+
+    @property
+    def executable(self) -> bool:
+        return bool(self.flags & PF_X)
+
+    @property
+    def end(self) -> int:
+        return self.vaddr + self.filesz
+
 
 @dataclass
-class Candidate:
-    score: int; call_va: int; call_rva: int
-    call_file_offset: Optional[int]; function_guess: Optional[int]
-    function_rva_guess: Optional[int]; target_va: Optional[int]
-    target_rva: Optional[int]; target_symbol: Optional[str]
-    call_kind: str; start_argument: Optional[int]
-    start_argument_register: Optional[str]; arg0_pointer: Optional[int]
-    arg0_preview: Optional[str]; evidence: List[str] = field(default_factory=list)
+class Section:
+    name: str
+    addr: int
+    offset: int
+    size: int
+    flags: int
 
-class ELFImage:
+    @property
+    def executable(self) -> bool:
+        return bool(self.flags & SHF_EXECINSTR)
+
+
+class ELF:
+    """Minimal, mmap-backed ELF reader.  Deliberately stdlib-only: the previous
+    version died because it materialised every segment, every string and every
+    decoded instruction in RAM at once."""
+
     def __init__(self, path: str):
-        self.path = path; self.fp = open(path, "rb")
-        self.elf = ELFFile(self.fp)
-        self.bits = self.elf.elfclass; self.little = self.elf.little_endian
-        self.machine = self.elf.header["e_machine"]
-        self.segments: List[Segment] = []; self.image_base = 0
-        self.executable: List[Tuple[int, bytes, str]] = []
-        self.strings: List[Tuple[int, bytes]] = []
-        self.imports: Dict[int, str] = {}; self.symbol_names: Dict[str, int] = {}
-        self.plt_targets: Dict[int, str] = {}; self.relocations: Dict[int, str] = {}
-        self._load_segments(); self._load_sections()
-        self._load_symbols_and_relocations(); self._load_strings()
+        self.path = path
+        self.fp = open(path, "rb")
+        self.filesize = os.fstat(self.fp.fileno()).st_size
+        self.buf = mmap.mmap(self.fp.fileno(), 0, access=mmap.ACCESS_READ)
+        if self.buf[:4] != b"\x7fELF":
+            raise SystemExit(f"not an ELF file: {path}")
+        self.bits = 64 if self.buf[4] == 2 else 32
+        self.little = self.buf[5] == 1
+        self.end = "<" if self.little else ">"
+        self.machine = self.u16(18)
+        self.e_flags = self.u32(36) if self.bits == 32 else self.u32(48)
+        self.segments: List[Segment] = []
+        self.sections: List[Section] = []
+        self._parse_phdrs()
+        self._parse_shdrs()
+        self.image_base = min((s.vaddr for s in self.segments), default=0)
 
-    def close(self): self.fp.close()
+    # -- primitive reads ----------------------------------------------------
+    def u16(self, off: int) -> int:
+        return struct.unpack_from(self.end + "H", self.buf, off)[0]
 
-    def _load_segments(self):
-        for i, seg in enumerate(self.elf.iter_segments()):
-            if seg["p_type"] != "PT_LOAD": continue
-            self.segments.append(Segment(
-                int(seg["p_vaddr"]), int(seg["p_offset"]), int(seg["p_filesz"]),
-                int(seg["p_memsz"]), int(seg["p_flags"]), seg.data(), f"PT_LOAD[{i}]"))
-        if self.segments:
-            self.image_base = min(s.vaddr & ~0xFFF for s in self.segments)
+    def u32(self, off: int) -> int:
+        return struct.unpack_from(self.end + "I", self.buf, off)[0]
 
-    def va_to_rva(self, va): return None if va is None else int(va - self.image_base)
+    def u64(self, off: int) -> int:
+        return struct.unpack_from(self.end + "Q", self.buf, off)[0]
 
-    def _load_sections(self):
-        for sec in self.elf.iter_sections():
-            try:
-                if int(sec["sh_flags"]) & 0x4 and sec["sh_size"]:
-                    self.executable.append((int(sec["sh_addr"]), sec.data(), sec.name or ".text"))
-            except Exception: pass
-        if not self.executable:
-            for seg in self.segments:
-                if seg.flags & 1 and seg.filesz:
-                    self.executable.append((seg.vaddr, seg.data, seg.name))
-        seen = set(); unique = []
-        for va, data, name in self.executable:
-            k = (va, len(data))
-            if k not in seen: seen.add(k); unique.append((va, data, name))
-        self.executable = sorted(unique, key=lambda x: x[0])
+    def word(self, off: int) -> int:
+        return self.u32(off) if self.bits == 32 else self.u64(off)
 
-    def _load_symbols_and_relocations(self):
-        for sec in self.elf.iter_sections():
-            if isinstance(sec, SymbolTableSection):
-                for sym in sec.iter_symbols():
-                    if not sym.name: continue
-                    v = int(sym["st_value"]); self.symbol_names[sym.name] = v
-                    if sec.name == ".dynsym" and sym["st_shndx"] == "SHN_UNDEF":
-                        self.imports[v] = sym.name
-            if isinstance(sec, RelocationSection):
-                symtab = self.elf.get_section(sec["sh_link"])
-                for rel in sec.iter_relocations():
-                    idx = int(rel["r_info_sym"])
-                    if not idx or symtab is None: continue
-                    try: name = symtab.get_symbol(idx).name
-                    except Exception: name = ""
-                    if name: self.relocations[int(rel["r_offset"])] = name
-        self.plt_targets = self._guess_plt_targets()
+    def read(self, off: int, size: int) -> bytes:
+        return bytes(self.buf[off:off + size])
 
-    def _guess_plt_targets(self):
-        result: Dict[int, str] = {}
-        relsec = None
-        for sec in self.elf.iter_sections():
-            if sec.name in (".rela.plt", ".rel.plt", ".rela.plt.sec", ".rel.plt.sec"):
-                relsec = sec; break
-        if relsec is None: return result
-        names = []
-        symtab = self.elf.get_section(relsec["sh_link"])
-        for rel in relsec.iter_relocations():
-            idx = int(rel["r_info_sym"])
-            try: names.append(symtab.get_symbol(idx).name if idx else "")
-            except Exception: names.append("")
-        for sec in self.elf.iter_sections():
-            if sec.name not in (".plt", ".plt.sec", ".iplt"): continue
-            entsize = int(sec["sh_entsize"] or 0) or (16 if self.bits == 64 else 12)
-            data = sec.data(); count = len(data) // entsize
-            first = 0 if sec.name in (".plt.sec", ".iplt") else 1
-            for i, name in enumerate(names):
-                slot = i + first
-                if slot < count and name:
-                    result[int(sec["sh_addr"]) + slot * entsize] = name
-        return result
+    # -- headers ------------------------------------------------------------
+    def _parse_phdrs(self) -> None:
+        if self.bits == 32:
+            phoff, phentsize, phnum = self.u32(28), self.u16(42), self.u16(44)
+        else:
+            phoff, phentsize, phnum = self.u64(32), self.u16(54), self.u16(56)
+        for i in range(phnum):
+            base = phoff + i * phentsize
+            if base + phentsize > self.filesize:
+                break
+            p_type = self.u32(base)
+            if p_type != PT_LOAD:
+                continue
+            if self.bits == 32:
+                offset, vaddr = self.u32(base + 4), self.u32(base + 8)
+                filesz, memsz = self.u32(base + 16), self.u32(base + 20)
+                flags = self.u32(base + 24)
+            else:
+                flags, offset = self.u32(base + 4), self.u64(base + 8)
+                vaddr, filesz = self.u64(base + 16), self.u64(base + 32)
+                memsz = self.u64(base + 40)
+            self.segments.append(Segment(vaddr, offset, filesz, memsz, flags))
 
-    # FIX 2: cap the string table so a huge .so cannot OOM the runner.
-    def _load_strings(self):
-        seen = set(); scanned = 0
+    def _parse_shdrs(self) -> None:
+        if self.bits == 32:
+            shoff, shentsize, shnum, shstrndx = (
+                self.u32(32), self.u16(46), self.u16(48), self.u16(50))
+        else:
+            shoff, shentsize, shnum, shstrndx = (
+                self.u64(40), self.u16(58), self.u16(60), self.u16(62))
+        if not shoff or not shnum:
+            return
+        raw = []
+        for i in range(shnum):
+            base = shoff + i * shentsize
+            if base + shentsize > self.filesize:
+                break
+            if self.bits == 32:
+                raw.append((self.u32(base), self.u32(base + 8), self.u32(base + 12),
+                            self.u32(base + 16), self.u32(base + 20)))
+            else:
+                raw.append((self.u32(base), self.u64(base + 8), self.u64(base + 16),
+                            self.u64(base + 24), self.u64(base + 32)))
+        if shstrndx >= len(raw):
+            return
+        _, _, _, stroff, strsize = raw[shstrndx]
+        strtab = bytes(self.buf[stroff:stroff + strsize])
+        for sh_name, sh_flags, sh_addr, sh_offset, sh_size in raw:
+            end = strtab.find(b"\x00", sh_name)
+            name = strtab[sh_name:end].decode("utf-8", "replace") if end >= 0 else ""
+            self.sections.append(Section(name, sh_addr, sh_offset, sh_size, sh_flags))
+
+    # -- address translation ------------------------------------------------
+    def va_to_off(self, va: int) -> Optional[int]:
         for seg in self.segments:
-            data = seg.data
-            for m in re.finditer(rb"[\x20-\x7e]{5,}\x00", data):
-                va = seg.vaddr + m.start(); raw = m.group()[:-1]
-                if (va, raw) not in seen:
-                    seen.add((va, raw))
-                    self.strings.append((va, raw))
-                    if len(self.strings) >= MAX_STRINGS:
-                        log(f"    [warn] string cap reached ({MAX_STRINGS}), stopping scan")
-                        self.strings.sort(key=lambda x: x[0]); return
-            scanned += len(data)
-            if scanned >= MAX_STR: break
-        self.strings.sort(key=lambda x: x[0])
-
-    def va_to_offset(self, va):
-        for seg in self.segments:
-            if seg.vaddr <= va < seg.vaddr + seg.filesz:
+            if seg.vaddr <= va < seg.end:
                 return seg.offset + (va - seg.vaddr)
         return None
 
-    def read_va(self, va, size):
+    def off_to_va(self, off: int) -> Optional[int]:
         for seg in self.segments:
-            if seg.vaddr <= va < seg.vaddr + seg.filesz:
-                off = va - seg.vaddr
-                return seg.data[off:off + size]
-        return b""
+            if seg.offset <= off < seg.offset + seg.filesz:
+                return seg.vaddr + (off - seg.offset)
+        return None
 
-    def preview_string(self, va, limit=96):
-        if va is None: return None
-        raw = self.read_va(va, limit)
-        if not raw: return None
-        raw = raw.split(b"\x00", 1)[0]
-        if len(raw) < 3: return None
-        printable = sum(1 for c in raw if 32 <= c < 127 or c in (9,10,13))
-        if printable / max(1, len(raw)) < 0.75: return None
-        return raw.decode("utf-8", "replace")[:limit]
+    def rva(self, va: Optional[int]) -> Optional[int]:
+        return None if va is None else int(va - self.image_base)
 
-def make_disassembler(img: ELFImage):
-    mach = str(img.machine)
-    endian = CS_MODE_LITTLE_ENDIAN if img.little else CS_MODE_BIG_ENDIAN
-    if mach in ("EM_X86_64", "62") or ("X86" in mach and img.bits == 64):
-        arch, mode = CS_ARCH_X86, CS_MODE_64
-    elif mach in ("EM_386", "3") or ("X86" in mach and img.bits == 32):
-        arch, mode = CS_ARCH_X86, CS_MODE_32
-    elif mach in ("EM_AARCH64", "183") or "AARCH64" in mach:
-        arch, mode = CS_ARCH_ARM64, endian
-    elif mach in ("EM_ARM", "40") or mach.endswith("ARM"):
-        flags = int(img.elf.header["e_flags"])
-        arch = CS_ARCH_ARM
-        mode = (CS_MODE_THUMB if (flags & 0x20) else CS_MODE_ARM) | endian
-    else:
-        raise RuntimeError(f"Unsupported ELF machine: {img.machine}")
-    md = Cs(arch, mode); md.detail = True; md.skipdata = True
-    return md, arch
+    def executable_ranges(self) -> List[Tuple[int, int, str]]:
+        """(vaddr, file_offset, size, name) for every executable byte range."""
+        out = []
+        for sec in self.sections:
+            if sec.executable and sec.size:
+                out.append((sec.addr, sec.offset, sec.size, sec.name))
+        if not out:
+            for seg in self.segments:
+                if seg.executable and seg.filesz:
+                    out.append((seg.vaddr, seg.offset, seg.filesz, "PT_LOAD"))
+        out.sort()
+        return out
 
-def reg_name(md, rid):
-    try: name = md.reg_name(rid).lower()
-    except Exception: return ""
-    aliases = {"eax":"rax","ebx":"rbx","ecx":"rcx","edx":"rdx","esi":"rsi","edi":"rdi",
-               "ebp":"rbp","esp":"rsp","ax":"rax","bx":"rbx","cx":"rcx","dx":"rdx",
-               "si":"rsi","di":"rdi","bp":"rbp","sp":"rsp"}
-    if name in aliases: return aliases[name]
-    if re.fullmatch(r"r(?:[89]|1[0-5])d", name): return name[:-1]
-    if re.fullmatch(r"w[0-9]+", name): return "x" + name[1:]
-    return name
+    def data_ranges(self) -> List[Tuple[int, int, int, str]]:
+        """Non-executable PT_LOAD ranges: literal pools, GOT, .data.rel.ro, ..."""
+        out = []
+        for seg in self.segments:
+            if seg.executable or not seg.filesz:
+                continue
+            out.append((seg.vaddr, seg.offset, seg.filesz, "PT_LOAD"))
+        return out
 
-def is_call(i):
-    m = i.mnemonic.lower()
-    return m in {"call","callq","bl","blr","blx"} or m.startswith("call ")
+    # -- byte search --------------------------------------------------------
+    def find_all(self, needle: bytes, limit: int = 64) -> List[int]:
+        """C-speed substring search over the whole mapped file."""
+        hits: List[int] = []
+        start = 0
+        while len(hits) < limit:
+            pos = self.buf.find(needle, start)
+            if pos < 0:
+                break
+            hits.append(pos)
+            start = pos + 1
+        return hits
 
-def is_ret(i):
-    m = i.mnemonic.lower(); o = i.op_str.lower()
-    return m.startswith("ret") or (m == "bx" and "lr" in o) or (m == "pop" and "pc" in o)
+    def close(self) -> None:
+        try:
+            self.buf.close()
+        finally:
+            self.fp.close()
 
-def get_ops(i):
-    try: return i.operands
-    except Exception: return []
 
-def effective_mem_address(i, op, state, arch):
-    try:
-        mem = op.mem
-        base = reg_name(i, mem.base) if mem.base else ""
-        index = reg_name(i, mem.index) if mem.index else ""
-        disp = int(mem.disp)
-        if arch == CS_ARCH_X86:
-            if base in ("rip","eip"): return int(i.address + i.size + disp)
-            v = state.get(base, 0) if base else 0
-            if index: v += state.get(index, 0) * int(mem.scale or 1)
-            return v + disp if base or index else None
-        if base: return state.get(base, 0) + disp if base in state else None
-        return disp if disp else None
-    except Exception: return None
+# ------------------------------------------------------------------------ anchors
+@dataclass
+class Anchor:
+    needle: bytes
+    weight: int
+    note: str
+    vas: List[int] = field(default_factory=list)
 
-def immediate_value(i, op):
-    try:
-        if op.type in (X86_OP_IMM, ARM_OP_IMM, ARM64_OP_IMM): return int(op.imm)
-    except Exception: pass
-    return None
 
-def destination_reg(i, arch):
-    ops = get_ops(i)
-    if not ops: return None
-    try:
-        if ops[0].type in (X86_OP_REG, ARM_OP_REG, ARM64_OP_REG): return reg_name(i, ops[0].reg)
-    except Exception: pass
-    return None
+# Ordered by how uniquely they identify CPython's PyRun_StringFlags path.
+ANCHOR_SPECS: Tuple[Tuple[bytes, int, str], ...] = (
+    (b"invalid start argument", 120,
+     "check_start() ValueError literal - only reachable from _PyRun_String/_PyRun_File"),
+    (b"<string>", 45,
+     "anonymous filename _PyRun_String substitutes when name == NULL"),
+    (b"__name__", 18, "globals lookup performed by _PyRun_String"),
+    (b"<stdin>", 12, "PyRun_AnyFile default filename (same translation unit)"),
+    (b"<module>", 10, "code object name used by the compiler"),
+    (b"Traceback (most recent call last):", 25, "CPython traceback printer"),
+    (b"co_consts", 12, "code object attribute"),
+    (b"co_code", 12, "code object attribute"),
+    (b"__builtins__", 14, "exec/eval globals setup"),
+    (b"importlib._bootstrap", 18, "frozen importlib bootstrap"),
+    (b"sys.modules", 10, "import machinery"),
+)
 
-def classify_call_target(i, state, arch):
-    ops = get_ops(i)
-    if not ops: return None, "indirect/unknown"
-    op = ops[0]; v = immediate_value(i, op)
-    if v is not None: return v, "direct"
-    try:
-        if op.type in (X86_OP_REG, ARM_OP_REG, ARM64_OP_REG):
-            r = reg_name(i, op.reg); v = state.get(r)
-            return v, "register-indirect" if v is not None else "register-indirect/unknown"
-        if op.type in (X86_OP_MEM, ARM_OP_MEM, ARM64_OP_MEM):
-            s = effective_mem_address(i, op, state, arch)
-            return s, "memory-indirect" if s is not None else "memory-indirect/unknown"
-    except Exception: pass
-    return None, "indirect/unknown"
+# Weaker markers: presence proves "a CPython runtime is in here" but not where.
+MARKER_SPECS: Tuple[bytes, ...] = (
+    b"SyntaxError: ", b"IndentationError", b"ZeroDivisionError",
+    b"Py_Initialize", b"_PyRuntime", b"PyEval_EvalCode", b"frame object",
+    b"__qualname__", b"__annotations__", b"__loader__", b"__spec__",
+    b"unittest.mock", b"collections.abc",
+)
 
-def update_state(i, state, arch):
-    m = i.mnemonic.lower(); ops = get_ops(i)
-    dst = destination_reg(i, arch)
-    if not dst: return
-    if len(ops) >= 2:
-        if m in ("add","adds") and len(ops) >= 3:
-            src = reg_name(i, ops[1].reg) if ops[1].type in (X86_OP_REG,ARM_OP_REG,ARM64_OP_REG) else ""
-            ai = immediate_value(i, ops[2])
-            if src in state and ai is not None:
-                state[dst] = state[src] + ai; return
-        imm = immediate_value(i, ops[1])
-        if imm is not None:
-            if m in ("movk","movk.w"):
-                shift = 0
-                for op in ops[2:]:
-                    if immediate_value(i, op) is not None: shift = int(op.imm)
-                old = state.get(dst, 0); mask = 0xFFFF << shift
-                state[dst] = (old & ~mask) | ((imm << shift) & mask)
-            elif m in ("movz","movn"):
-                shift = 0
-                if len(ops) >= 3:
-                    sh = immediate_value(i, ops[2])
-                    if sh is not None: shift = sh
-                state[dst] = ((~imm if m == "movn" else imm) << shift) & ((1<<64)-1)
-            elif m in ("adr","adrp"):
-                state[dst] = (imm & ~0xFFF) if m == "adrp" else imm
-            elif m in ("add","adds") and ops[1].type in (X86_OP_REG,ARM_OP_REG,ARM64_OP_REG):
-                src = reg_name(i, ops[1].reg)
-                if src in state: state[dst] = state[src] + imm
-                else: state.pop(dst, None)
-            else: state[dst] = imm
+
+def find_anchors(elf: ELF) -> List[Anchor]:
+    """Resolve every anchor literal to its virtual address(es)."""
+    anchors: List[Anchor] = []
+    for needle, weight, note in ANCHOR_SPECS:
+        anchor = Anchor(needle, weight, note)
+        for off in elf.find_all(needle, limit=16):
+            va = elf.off_to_va(off)
+            if va is not None and va not in anchor.vas:
+                anchor.vas.append(va)
+        anchors.append(anchor)
+    return anchors
+
+
+def runtime_markers(elf: ELF) -> List[str]:
+    """Which CPython marker strings are present at all (sanity check on the runtime)."""
+    found = []
+    for needle in MARKER_SPECS:
+        if elf.find_all(needle, limit=1):
+            found.append(needle.decode("utf-8", "replace"))
+    return found
+
+
+# -------------------------------------------------------------------------- xrefs
+@dataclass
+class Xref:
+    va: int                 # address of the referencing code/data slot
+    target: int             # anchor VA being referenced
+    kind: str               # literal-pool | movw/movt | adrp/add | pc-relative | got
+    note: str = ""
+
+
+@dataclass
+class CodeScan:
+    """Results of the single linear pass over executable bytes."""
+    calls: List[Tuple[int, int]] = field(default_factory=list)        # (site, target)
+    movw: List[Tuple[int, int, int]] = field(default_factory=list)   # (site, rd, imm16)
+    movt: List[Tuple[int, int, int]] = field(default_factory=list)
+    mode_cmps: List[Tuple[int, int, int]] = field(default_factory=list)  # (site, reg, mode)
+    pc_refs: List[Tuple[int, int]] = field(default_factory=list)     # (site, target)
+    zeros: List[Tuple[int, int]] = field(default_factory=list)       # (site, reg)
+    adrp: List[Tuple[int, int, int]] = field(default_factory=list)   # (site, rd, page)
+
+
+def _words_of(elf: ELF, data: bytes) -> "array.array":
+    import array
+    usable = len(data) - (len(data) % 4)
+    words = array.array("I")
+    words.frombytes(data[:usable])
+    if elf.little != (sys.byteorder == "little"):
+        words.byteswap()
+    return words
+
+
+def _sign(value: int, bits: int) -> int:
+    if value & (1 << (bits - 1)):
+        return value - (1 << bits)
+    return value
+
+
+def scan_code(elf: ELF, deep: bool = False) -> CodeScan:
+    """One linear pass over executable ranges collecting everything the later
+    stages need (call sites, address materialisations, start-mode comparisons,
+    register zeroing).  Kept in a single pass so we never revisit 52 MB of .text."""
+    scan = CodeScan()
+    for vaddr, off, size, _name in elf.executable_ranges():
+        data = bytes(elf.buf[off:off + size])
+        words = _words_of(elf, data)
+        base = vaddr
+        if elf.machine == EM_ARM:
+            for idx, w in enumerate(words):
+                site = base + idx * 4
+                if (w & 0x0E000000) == 0x0A000000:                 # B / BL
+                    imm = _sign(w & 0xFFFFFF, 24)
+                    scan.calls.append((site, site + 8 + (imm << 2)))
+                elif (w & 0x0FF00000) == 0x03000000:               # MOVW
+                    rd = (w >> 12) & 0xF
+                    imm16 = (((w >> 16) & 0xF) << 12) | (w & 0xFFF)
+                    scan.movw.append((site, rd, imm16))
+                elif (w & 0x0FF00000) == 0x03400000:               # MOVT
+                    rd = (w >> 12) & 0xF
+                    imm16 = (((w >> 16) & 0xF) << 12) | (w & 0xFFF)
+                    scan.movt.append((site, rd, imm16))
+                elif (w & 0xFFFF0000) == 0xE28F0000:               # ADD Rd, pc, #imm
+                    scan.pc_refs.append((site, site + 8 + (w & 0xFFF)))
+                elif (w & 0xFFF00000) == 0xE3500000:               # CMP Rd, #imm
+                    imm = w & 0xFFF
+                    if imm in START_MODES:
+                        scan.mode_cmps.append((site, (w >> 16) & 0xF, imm))
+                elif (w & 0xFFFF0000) in (0xE3A00000, 0xE3B00000):  # MOV/MOVS Rd, #0
+                    if (w & 0xFFF) == 0:
+                        scan.zeros.append((site, (w >> 12) & 0xF))
+        elif elf.machine == EM_AARCH64:
+            for idx, w in enumerate(words):
+                site = base + idx * 4
+                if (w & 0xFC000000) == 0x94000000:                 # BL
+                    scan.calls.append((site, site + (_sign(w & 0x3FFFFFF, 26) << 2)))
+                elif (w & 0x9F000000) == 0x90000000:               # ADRP
+                    rd = w & 0x1F
+                    immlo = (w >> 29) & 3
+                    immhi = (w >> 5) & 0x7FFFF
+                    imm = _sign((immhi << 2) | immlo, 21)
+                    scan.adrp.append((site, rd, (site & ~0xFFF) + (imm << 12)))
+                elif (w & 0x7F000000) == 0x11000000:               # ADD (imm)
+                    scan.pc_refs.append((site, (w & 0x1F, (w >> 5) & 0x1F, (w >> 10) & 0xFFF)))
+                elif (w & 0xFFC0001F) == 0xF100001F:               # CMP/SUBS xzr, xN, #imm
+                    imm = (w >> 10) & 0xFFF
+                    if imm in START_MODES:
+                        scan.mode_cmps.append((site, (w >> 5) & 0x1F, imm))
+                elif (w & 0x7F800000) == 0x52800000:               # MOVZ Wd, #0
+                    if ((w >> 5) & 0xFFFF) == 0 and ((w >> 21) & 3) == 0:
+                        scan.zeros.append((site, w & 0x1F))
+        elif elf.machine in (EM_X86_64, EM_386):
+            # x86 is best-effort here; capstone (when present) does the real work.
+            pos = data.find(b"\xe8")
+            while pos >= 0:
+                if pos + 5 <= len(data):
+                    rel = struct.unpack_from("<i", data, pos + 1)[0]
+                    scan.calls.append((base + pos, base + pos + 5 + rel))
+                pos = data.find(b"\xe8", pos + 1)
+        if deep and elf.machine == EM_ARM:
+            _scan_thumb16(elf, data, base, scan)
+    return scan
+
+
+def _scan_thumb16(elf: ELF, data: bytes, base: int, scan: CodeScan) -> None:
+    """Thumb-16 ADR / MOVS-zero pass (2-byte aligned).  Thumb-2 32-bit forms are
+    covered by the 4-byte pass above when they happen to be 4-aligned."""
+    for pos in range(0, len(data) - 1, 2):
+        hw = data[pos] | (data[pos + 1] << 8)
+        site = base + pos
+        if (hw & 0xF800) == 0xA000:                                # ADR Rd, #imm8
+            scan.pc_refs.append((site, ((site + 4) & ~3) + ((hw & 0xFF) << 2)))
+        elif (hw & 0xFF00) == 0x2000 and (hw & 0xFF) == 0:         # MOVS Rd, #0
+            scan.zeros.append((site, (hw >> 8) & 7))
+
+
+def collect_xrefs(elf: ELF, targets: Set[int], scan: CodeScan) -> List[Xref]:
+    """All references to any anchor VA, from code or from data."""
+    xrefs: List[Xref] = []
+    seen: Set[Tuple[int, int]] = set()
+
+    def add(va: int, target: int, kind: str, note: str = "") -> None:
+        key = (va, target)
+        if key in seen:
             return
+        seen.add(key)
+        xrefs.append(Xref(va, target, kind, note))
+
+    # 1. Absolute pointer stored anywhere (literal pool, GOT, .data.rel.ro, vtable).
+    #    C-speed: one bytes.find per (target, word-size) instead of a Python loop.
+    for target in targets:
+        if elf.bits == 32:
+            packers = ((struct.pack("<I", target & 0xFFFFFFFF), 4),)
+        else:
+            packers = ((struct.pack("<Q", target & 0xFFFFFFFFFFFFFFFF), 8),)
+        for needle, size in packers:
+            for off in elf.find_all(needle, limit=64):
+                va = elf.off_to_va(off)
+                if va is None:
+                    continue
+                kind = "literal-pool" if _is_exec(elf, va) else "data-pointer"
+                add(va, target, kind, f"{size}-byte pointer")
+
+    # 2. ARM movw/movt pairs (how PIC code materialises a local address).
+    pending: Dict[int, Tuple[int, int]] = {}
+    for site, rd, imm16 in scan.movw:
+        pending[rd] = (site, imm16)
+    for site, rd, imm16 in scan.movt:
+        prev = pending.get(rd)
+        if not prev:
+            continue
+        movw_site, low = prev
+        if site - movw_site > 64:
+            continue
+        value = (imm16 << 16) | low
+        if value in targets:
+            add(movw_site, value, "movw/movt", f"built in r{rd}")
+
+    # 3. ARM64 ADRP + ADD pairs.
+    adrp_state: Dict[int, int] = {}
+    for site, rd, page in scan.adrp:
+        adrp_state[rd] = page
+    for entry in scan.pc_refs:
+        if not isinstance(entry[1], tuple):
+            continue
+        site, (rd, rn, imm12) = entry
+        page = adrp_state.get(rn)
+        if page is None:
+            continue
+        value = page + imm12
+        if value in targets:
+            add(site, value, "adrp/add", f"x{rd} <- page(x{rn}) + {imm12}")
+
+    # 4. ARM32 PC-relative ADD (no relocation needed, very common in PIC).
+    for site, value in scan.pc_refs:
+        if isinstance(value, int) and value in targets:
+            add(site, value, "pc-relative", "add Rd, pc, #imm")
+
+    return xrefs
+
+
+def _is_exec(elf: ELF, va: int) -> bool:
+    for vaddr, _off, size, _n in elf.executable_ranges():
+        if vaddr <= va < vaddr + size:
+            return True
+    return False
+
+
+# ------------------------------------------------------------------ function start
+def prologue_before(elf: ELF, addr: int, max_back: int = PROLOGUE_SCAN) -> Optional[int]:
+    """Best-effort enclosing-function start for `addr`, by scanning backwards for a
+    recognised prologue.  Good enough to report an RVA; the capstone verification
+    step afterwards confirms the hit."""
+    rng = None
+    for vaddr, off, size, _name in elf.executable_ranges():
+        if vaddr <= addr < vaddr + size:
+            rng = (vaddr, off, size)
+            break
+    if rng is None:
+        return None
+    vaddr, off, size = rng
+    start_va = max(vaddr, addr - max_back)
+    lo = off + (start_va - vaddr)
+    hi = off + (addr - vaddr)
+    data = bytes(elf.buf[lo:hi])
+    if not data:
+        return None
+
+    if elf.machine == EM_ARM:
+        for pos in range(len(data) - 4, -1, -2):
+            w = struct.unpack_from("<I", data, pos)[0]
+            if (w & 0xFFFF4000) == 0xE92D4000:        # stmdb sp!, {..., lr}
+                return start_va + pos
+        for pos in range(len(data) - 2, -1, -2):
+            hw = data[pos] | (data[pos + 1] << 8)
+            if (hw & 0xFF00) == 0xB500:               # thumb push {..., lr}
+                return start_va + pos
+    elif elf.machine == EM_AARCH64:
+        for pos in range(len(data) - 4, -1, -4):
+            w = struct.unpack_from("<I", data, pos)[0]
+            if (w & 0xFFC07FFF) == 0xA9807BFD:        # stp x29, x30, [sp, #-N]!
+                return start_va + pos
+    elif elf.machine in (EM_X86_64, EM_386):
+        for pos in range(len(data) - 1, -1, -1):
+            if data[pos:pos + 4] == b"\xf3\x0f\x1e\xfa":   # endbr64
+                return start_va + pos
+            if data[pos] == 0x55:                          # push rbp
+                return start_va + pos
+    return None
+
+
+# ------------------------------------------------------------------ identification
+FUNCTION_SPAN = 0x2000      # how far past a function start we attribute evidence
+NAME_ARG_REG = {EM_ARM: 1, EM_AARCH64: 1, EM_X86_64: 1, EM_386: 1}
+
+
+@dataclass
+class FunctionHit:
+    va: int
+    role: str
+    score: int
+    evidence: List[str] = field(default_factory=list)
+    anchors: List[str] = field(default_factory=list)
+    mode_cmps: List[int] = field(default_factory=list)
+    call_sites: List[int] = field(default_factory=list)
+
+    @property
+    def rva(self) -> int:
+        return self.va
+
+    def as_dict(self, elf: ELF) -> dict:
+        return {
+            "role": self.role,
+            "score": self.score,
+            "va": hex(self.va),
+            "rva": hex(elf.rva(self.va) or 0),
+            "file_offset": _hex(elf.va_to_off(self.va)),
+            "anchors": self.anchors,
+            "start_mode_constants": [hex(m) for m in self.mode_cmps],
+            "call_sites": [hex(c) for c in self.call_sites],
+            "evidence": self.evidence,
+        }
+
+
+def _hex(value: Optional[int]) -> Optional[str]:
+    return None if value is None else hex(value)
+
+
+def group_by_function(elf: ELF, xrefs: Sequence[Xref]) -> Dict[int, List[Xref]]:
+    grouped: Dict[int, List[Xref]] = {}
+    for xref in xrefs:
+        fn = prologue_before(elf, xref.va)
+        if fn is None:
+            continue
+        grouped.setdefault(fn, []).append(xref)
+    return grouped
+
+
+def identify(elf: ELF, anchors: Sequence[Anchor], xrefs: Sequence[Xref],
+             scan: CodeScan, deep: bool = False) -> Tuple[List[FunctionHit], List[FunctionHit]]:
+    """Return (runtime_functions, flag_entrypoints).
+
+    runtime_functions are the recovered _PyRun_String / _PyRun_File bodies;
+    flag_entrypoints are the callers that pass name == NULL, i.e. the function the
+    game actually calls -- PyRun_StringFlags under whatever name it now has."""
+    anchor_by_va: Dict[int, Anchor] = {}
+    for anchor in anchors:
+        for va in anchor.vas:
+            anchor_by_va[va] = anchor
+
+    grouped = group_by_function(elf, xrefs)
+    runtime: List[FunctionHit] = []
+
+    for fn, hits in grouped.items():
+        hit = FunctionHit(fn, "_PyRun_String / _PyRun_File", 0)
+        for xref in hits:
+            anchor = anchor_by_va.get(xref.target)
+            if anchor is None:
+                continue
+            label = anchor.needle.decode("utf-8", "replace")
+            if label in hit.anchors:
+                continue                      # count each anchor once, not per xref
+            hit.score += anchor.weight
+            hit.anchors.append(label)
+            hit.evidence.append(
+                f"references \"{label}\" @ {hex(xref.target)} via {xref.kind} at {hex(xref.va)}")
+        if hit.score:
+            runtime.append(hit)
+
+    # check_start()'s switch is inlined into both _PyRun_String and _PyRun_File,
+    # so a function containing all three start tokens is a runtime candidate even
+    # if every string literal was obfuscated away.
+    cmps_by_fn: Dict[int, List[int]] = {}
+    for site, _reg, mode in scan.mode_cmps:
+        fn = prologue_before(elf, site)
+        if fn is not None:
+            cmps_by_fn.setdefault(fn, []).append(mode)
+    for fn, modes in cmps_by_fn.items():
+        if len(set(modes)) < 3:
+            continue
+        existing = next((h for h in runtime if h.va == fn), None)
+        if existing is None:
+            existing = FunctionHit(fn, "_PyRun_String / _PyRun_File", 0)
+            runtime.append(existing)
+        existing.mode_cmps = sorted(set(modes))
+        existing.score += 25
+        existing.evidence.append(
+            "compares against all start tokens " + ", ".join(str(m) for m in sorted(set(modes))))
+
+    runtime.sort(key=lambda h: -h.score)
+
+    # PyRun_StringFlags is the unique caller of _PyRun_String that passes name=NULL.
+    runtime_vas = {h.va for h in runtime}
+    callers: Dict[int, List[int]] = {}
+    for site, target in scan.calls:
+        if target in runtime_vas:
+            fn = prologue_before(elf, site)
+            if fn is not None:
+                callers.setdefault(fn, []).append(site)
+
+    zero_by_reg: Dict[int, List[int]] = {}
+    for site, reg in scan.zeros:
+        zero_by_reg.setdefault(reg, []).append(site)
+    name_reg = NAME_ARG_REG.get(elf.machine, 1)
+
+    entrypoints: List[FunctionHit] = []
+    for fn, sites in callers.items():
+        if fn in runtime_vas:
+            continue
+        hit = FunctionHit(fn, "PyRun_StringFlags candidate", 40)
+        hit.call_sites = sorted(sites)
+        hit.evidence.append(
+            f"calls the recovered runtime at {', '.join(hex(s) for s in hit.call_sites[:4])}")
+        for site in sites:
+            if any(0 <= site - z <= 64 for z in zero_by_reg.get(name_reg, ())):
+                hit.score += 55
+                hit.evidence.append(
+                    f"zeroes argument register r{name_reg}/x{name_reg} before the call "
+                    f"(name == NULL -> PyRun_StringFlags)")
+                break
+        entrypoints.append(hit)
+
+    entrypoints.sort(key=lambda h: -h.score)
+    return runtime, entrypoints
+
+
+def capstone_verify(elf: ELF, va: int, anchor_vas: Dict[int, str],
+                    span: int = 0x1000) -> Optional[List[str]]:
+    """Opportunistic confirmation: disassemble the first `span` bytes of a function
+    and report which anchors it actually loads.  Returns None when capstone is not
+    installed, so the tool still works without it."""
+    try:
+        from capstone import (Cs, CS_ARCH_ARM, CS_ARCH_ARM64, CS_ARCH_X86,
+                              CS_MODE_32, CS_MODE_64, CS_MODE_ARM, CS_MODE_THUMB,
+                              CS_MODE_LITTLE_ENDIAN)
+    except ImportError:
+        return None
+    off = elf.va_to_off(va)
+    if off is None:
+        return None
+    code = bytes(elf.buf[off:off + span])
+    if not code:
+        return None
+
+    if elf.machine == EM_ARM:
+        candidates = [(CS_ARCH_ARM, CS_MODE_ARM), (CS_ARCH_ARM, CS_MODE_THUMB)]
+    elif elf.machine == EM_AARCH64:
+        candidates = [(CS_ARCH_ARM64, CS_MODE_64)]
+    elif elf.machine in (EM_X86_64, EM_386):
+        candidates = [(CS_ARCH_X86, CS_MODE_64 if elf.bits == 64 else CS_MODE_32)]
+    else:
+        return None
+
+    import re as _re
+    best: Optional[List[str]] = None
+    for arch, mode in candidates:
+        md = Cs(arch, mode | CS_MODE_LITTLE_ENDIAN)
+        md.detail = False
+        notes: List[str] = []
         try:
-            if ops[1].type in (X86_OP_REG,ARM_OP_REG,ARM64_OP_REG):
-                src = reg_name(i, ops[1].reg)
-                if src in state: state[dst] = state[src]; return
-        except Exception: pass
-        try:
-            if ops[1].type in (X86_OP_MEM,ARM_OP_MEM,ARM64_OP_MEM):
-                ea = effective_mem_address(i, ops[1], state, arch)
-                if ea is not None: state[dst] = ea; return
-        except Exception: pass
-    state.pop(dst, None)
+            for insn in md.disasm(code, va):
+                text = f"{insn.mnemonic} {insn.op_str}"
+                for imm in _re.findall(r"#(0x[0-9a-f]+|\d+)", text):
+                    value = int(imm, 0)
+                    if value in anchor_vas:
+                        notes.append(f"{hex(insn.address)}: {text}  ; \"{anchor_vas[value]}\"")
+                if "pc" in insn.op_str or "rip" in insn.op_str:
+                    m = _re.search(r"(?:pc|rip)[^#]*#(-?0x[0-9a-f]+|-?\d+)", insn.op_str)
+                    if m:
+                        disp = int(m.group(1), 0)
+                        base = insn.address + insn.size + disp
+                        if elf.machine == EM_ARM:
+                            base = insn.address + 8 + disp
+                        target = elf.off_to_va(base)
+                        if target in anchor_vas:
+                            notes.append(f"{hex(insn.address)}: {text}  ; \"{anchor_vas[target]}\"")
+        except Exception:
+            continue
+        if notes and (best is None or len(notes) > len(best)):
+            best = notes
+    return best
 
-def argument_registers(img, arch):
-    if arch == CS_ARCH_X86 and img.bits == 64: return ["rdi","rsi","rdx","rcx","r8"]
-    if arch == CS_ARCH_ARM64: return ["x0","x1","x2","x3","x4"]
-    if arch == CS_ARCH_ARM: return ["r0","r1","r2","r3"]
-    return []
 
-def is_python_start(v): return v in (256,257,258,0x100,0x101,0x102)
-
-def looks_like_decoder(insns, start, end):
-    window = insns[start:end]
-    counts = Counter(i.mnemonic.lower().split(".")[0] for i in window)
-    bitops = sum(counts[m] for m in DECODE_MNEMONICS)
-    branches = sum(1 for i in window if i.mnemonic.lower().startswith(("b","j"))
-                   and not i.mnemonic.lower().startswith(("bic","bfi","bfx")))
-    stores = sum(1 for i in window if i.mnemonic.lower().startswith(("str","st","mov","stos")))
-    score = 0; ev = []
-    if bitops >= 3: score += min(20, bitops*2); ev.append(f"bitwise ops: {bitops}")
-    if branches >= 2: score += 8; ev.append(f"branches: {branches}")
-    if stores >= 2:  score += 4; ev.append(f"stores: {stores}")
-    return score, ev
-
-def guess_function_start(insns, index, arch):
-    lo = max(0, index - 220); cands = []
-    for j in range(index, lo - 1, -1):
-        m = insns[j].mnemonic.lower(); o = insns[j].op_str.lower()
-        if arch == CS_ARCH_X86:
-            if m == "push" and ("rbp" in o or "ebp" in o): cands.append(j)
-            elif m in ("endbr64","endbr32"): cands.append(j)
-        elif arch == CS_ARCH_ARM64:
-            if m == "stp" and "x29" in o and "x30" in o: cands.append(j)
-            elif m == "sub" and o.startswith("sp, sp,"): cands.append(j)
-        elif arch == CS_ARCH_ARM:
-            if m in ("push","stmdb") and ("lr" in o or "sp!" in o): cands.append(j)
-        if j < index and (is_ret(insns[j]) or m in ("b","jmp","bx")): break
-    return insns[cands[0]].address if cands else None
-
-# FIX 3: stream disassembly, cap instructions, progress log.
-def decode_analysis(img: ELFImage, window: int = 28):
-    md, arch = make_disassembler(img)
-    argregs = argument_registers(img, arch)
-    candidates: List[Candidate] = []
-    decoder_windows = []; total_insns = 0
-    imported_python = {n: a for a, n in img.imports.items() if n.startswith("Py") or "python" in n.lower()}
-    py_clue_strings = [(va, s.decode("utf-8","replace")) for va, s in img.strings
-                       if any(c.lower() in s.lower() for c in PYTHON_CLUES)]
-
-    DISASM_CHUNK = 1 << 16          # 64 KiB windows — capstone never sees the full 52 MB
-    for base, code, secname in img.executable:
-        log(f"[*] disassembling {secname} @ 0x{base:x} ({len(code)} bytes)")
-        insns = []; remaining = len(code); off = 0; section_insns = 0
-        try:
-            while remaining > 0 and section_insns < MAX_INSTRUCTIONS_PER_SECTION:
-                chunk = code[off:off + DISASM_CHUNK]
-                for ins in md.disasm(chunk, base + off):
-                    insns.append(ins); section_insns += 1
-                    if section_insns >= MAX_INSTRUCTIONS_PER_SECTION:
-                        log(f"    [warn] instruction cap reached at 0x{ins.address:x}")
-                        break
-                off += len(chunk); remaining -= len(chunk)
-                if remaining <= 0: break
-        except Exception as e:
-            log(f"    [warn] disasm error: {e!r}")
-        total_insns += len(insns)
-        log(f"    -> {len(insns)} instructions")
-        if not insns: continue
-
-        for i, insn in enumerate(insns):
-            if not is_call(insn): continue
-            lo = max(0, i - window); state = {}
-            for prev in insns[lo:i]: update_state(prev, state, arch)
-            av = [state.get(r) for r in argregs]
-            start_value = av[1] if len(av) > 1 else None
-            arg0 = av[0] if av else None
-            target, kind = classify_call_target(insn, state, arch)
-            sym = None
-            if target is not None:
-                sym = img.plt_targets.get(target) or img.relocations.get(target)
-            score = 0; ev = []
-            if sym in PYRUN_NAMES:
-                score += PYRUN_NAMES[sym]; ev.append(f"target={sym}")
-            elif sym and (sym.startswith("PyRun_") or sym.startswith("Py_Compile")):
-                score += 70; ev.append(f"python API target={sym}")
-            if is_python_start(start_value):
-                score += 42; ev.append(f"start_mode={start_value}")
-            elif start_value in (0,1,2,3):
-                score += 4; ev.append(f"small enum arg1={start_value}")
-            prev_str = img.preview_string(arg0) if arg0 is not None else None
-            if prev_str:
-                score += 15; ev.append("arg0 -> readable string")
-                if any(k in prev_str.lower() for k in ("import ","def ","class ","exec","eval","python")):
-                    score += 7; ev.append("arg0 looks like Python source")
-            elif arg0 is not None and img.va_to_offset(arg0) is not None:
-                score += 5; ev.append("arg0 points into ELF")
-            nearby = insns[lo:i]
-            if any((img.plt_targets.get(int(op.imm), "").startswith("Py") if immediate_value(x, op) is not None else False)
-                   for x in nearby for op in get_ops(x)):
-                score += 5; ev.append("nearby Python PLT reference")
-            if imported_python: score += 2; ev.append(f"imports {len(imported_python)} Py APIs")
-            ds, de = looks_like_decoder(insns, lo, i + 1)
-            if ds: score += min(8, ds // 4); ev.extend(de[:2])
-            if score >= 12:
-                off = img.va_to_offset(insn.address)
-                fn = guess_function_start(insns, i, arch)
-                candidates.append(Candidate(
-                    score=score, call_va=int(insn.address),
-                    call_rva=int(img.va_to_rva(int(insn.address))),
-                    call_file_offset=off, function_guess=fn,
-                    function_rva_guess=img.va_to_rva(fn),
-                    target_va=target, target_rva=img.va_to_rva(target),
-                    target_symbol=sym, call_kind=kind,
-                    start_argument=start_value,
-                    start_argument_register=argregs[1] if len(argregs) > 1 else None,
-                    arg0_pointer=arg0, arg0_preview=prev_str, evidence=ev))
-
-        for st in range(0, max(1, len(insns) - 48), 24):
-            sc, ev = looks_like_decoder(insns, st, min(len(insns), st + 72))
-            if sc >= 18:
-                decoder_windows.append({
-                    "va": int(insns[st].address),
-                    "file_offset": img.va_to_offset(int(insns[st].address)),
-                    "score": sc, "section": secname, "evidence": ev})
-
-    summary = {
-        "architecture": str(img.machine), "bits": img.bits,
-        "endianness": "little" if img.little else "big",
-        "image_base": hex(img.image_base),
-        "executable_ranges": [{"name": n, "va": hex(a), "size": len(d)} for a, d, n in img.executable],
-        "instruction_count": total_insns,
-        "python_related_imports": sorted(set(img.imports.values()).intersection(
-            set(PYRUN_NAMES) | {n for n in img.imports.values() if n.startswith("Py")})),
-        "python_clue_strings": [{"va": hex(a), "text": s[:180]} for a, s in py_clue_strings[:100]],
-        "decoder_like_windows": sorted(decoder_windows, key=lambda x: x["score"], reverse=True)[:40],
-        "relocation_count": len(img.relocations),
-    }
-    dedup = {}
-    for c in candidates:
-        if c.call_va not in dedup or c.score > dedup[c.call_va].score:
-            dedup[c.call_va] = c
-    return sorted(dedup.values(), key=lambda c: (-c.score, c.call_va)), summary
-
+# ------------------------------------------------------------------------ entropy
 def entropy(data: bytes) -> float:
-    if not data: return 0.0
-    counts = Counter(data); n = len(data)
-    return -sum((v/n) * math.log2(v/n) for v in counts.values())
+    if not data:
+        return 0.0
+    counts = [0] * 256
+    for byte in data:
+        counts[byte] += 1
+    n = len(data)
+    total = 0.0
+    for c in counts:
+        if c:
+            p = c / n
+            total -= p * math.log2(p)
+    return total
 
-# FIX 4: cap total bytes scanned; cheap stride; bail out early.
-def find_high_entropy_ranges(img: ELFImage, min_size=32, max_ranges=60):
-    found = []; budget = MAX_ENTROPY_BYTES
-    for seg in img.segments:
-        data = seg.data
-        if not data or budget <= 0: break
-        take = min(len(data), budget); budget -= take
-        step = 64
-        for off in range(0, take - min_size + 1, step):
-            chunk = data[off:off + 96]
-            e = entropy(chunk)
-            if e >= 7.1:
-                found.append({"va": hex(seg.vaddr + off),
-                              "file_offset": seg.offset + off,
-                              "size_scanned": len(chunk),
-                              "entropy_bits_per_byte": round(e, 3),
-                              "note": "high entropy; may be ciphertext/compressed"})
-    found.sort(key=lambda x: x["entropy_bits_per_byte"], reverse=True)
-    res = []; used = []
-    for it in found:
-        if any(abs(it["file_offset"] - u) < 96 for u in used): continue
-        res.append(it); used.append(it["file_offset"])
-        if len(res) >= max_ranges: break
-    return res
 
-def print_report(img, candidates, summary, entropy_ranges, limit):
-    print(f"\n[+] File: {img.path}")
-    print(f"[+] ELF: {summary['bits']}-bit {summary['endianness']}, machine={summary['architecture']}")
-    print(f"[+] Instructions: {summary['instruction_count']}")
-    print(f"[+] Image base: {summary['image_base']}")
-    print(f"[+] Relocations: {summary['relocation_count']}")
-    py = summary["python_related_imports"]
-    print("[+] Python imports: " + (", ".join(py) if py else "none"))
-    clues = summary["python_clue_strings"]
-    print(f"[+] Clue strings: {len(clues)}")
-    for it in clues[:12]: print(f"    {it['va']}: {it['text'][:120]!r}")
-    print("\n[+] Call-site candidates:")
-    if not candidates: print("    (none)")
-    for c in candidates[:limit]:
-        print(f"\n    score={c.score} RVA=0x{c.call_rva:x} VA=0x{c.call_va:x} "
-              f"off={hex(c.call_file_offset) if c.call_file_offset is not None else 'n/a'}")
-        print(f"      fn_rva={hex(c.function_rva_guess) if c.function_rva_guess is not None else '?'} "
-              f"tgt={c.target_symbol or '?'} kind={c.call_kind}")
-        print(f"      arg1={c.start_argument} arg0={hex(c.arg0_pointer) if c.arg0_pointer is not None else '?'}")
-        if c.arg0_preview: print(f"      arg0_text={c.arg0_preview[:140]!r}")
-        for e in c.evidence: print(f"      - {e}")
-    print("\n[+] Decoder-like windows:")
-    for it in summary["decoder_like_windows"][:12]:
-        print(f"    VA={it['va']} off={it['file_offset']} score={it['score']} sec={it['section']}")
-    if not summary["decoder_like_windows"]: print("    (none)")
-    print("\n[+] High-entropy ranges:")
-    for it in entropy_ranges[:12]:
-        print(f"    VA={it['va']} off={it['file_offset']} H={it['entropy_bits_per_byte']}")
-    if not entropy_ranges: print("    (none)")
+def high_entropy_ranges(elf: ELF, budget: int = 16 * 1024 * 1024,
+                        step: int = 4096, limit: int = 40) -> List[dict]:
+    """Sampled scan -- never walks all 84 MB, never allocates per-window objects."""
+    found: List[dict] = []
+    remaining = budget
+    for seg in elf.segments:
+        if remaining <= 0:
+            break
+        end = min(seg.filesz, remaining)
+        remaining -= end
+        for rel in range(0, max(0, end - 256), step):
+            chunk = bytes(elf.buf[seg.offset + rel: seg.offset + rel + 256])
+            score = entropy(chunk)
+            if score >= 7.2:
+                found.append({
+                    "va": hex(seg.vaddr + rel),
+                    "file_offset": seg.offset + rel,
+                    "size_scanned": len(chunk),
+                    "entropy_bits_per_byte": round(score, 3),
+                    "note": "high entropy; packed/compressed/ciphertext",
+                })
+    found.sort(key=lambda x: -x["entropy_bits_per_byte"])
+    return found[:limit]
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("so")
-    ap.add_argument("--window", type=int, default=28)
-    ap.add_argument("--max-candidates", type=int, default=25)
-    ap.add_argument("--json", dest="json_path")
-    ap.add_argument("--entropy", action="store_true")
-    args = ap.parse_args()
+
+# ------------------------------------------------------------------------- report
+def print_report(elf: ELF, anchors: Sequence[Anchor], markers: Sequence[str],
+                 runtime: Sequence[FunctionHit], entrypoints: Sequence[FunctionHit],
+                 verified: Dict[int, Optional[List[str]]], entropy_ranges: Sequence[dict],
+                 limit: int) -> None:
+    print(f"\n[+] File: {elf.path}")
+    print(f"[+] ELF: {elf.bits}-bit {'little' if elf.little else 'big'}-endian, "
+          f"machine={elf.machine}, base={hex(elf.image_base)}")
+    print(f"[+] Executable ranges: {len(elf.executable_ranges())}")
+
+    print("\n[+] Anchor literals:")
+    for anchor in anchors:
+        label = anchor.needle.decode("utf-8", "replace")
+        if anchor.vas:
+            print(f"    FOUND  {label!r} @ {', '.join(hex(v) for v in anchor.vas[:4])}")
+        else:
+            print(f"    absent {label!r}")
+
+    print("\n[+] CPython runtime markers: " + (", ".join(markers) if markers else "none"))
+    if not markers and not any(a.vas for a in anchors):
+        print("    [!] No CPython markers at all -- the runtime may be packed, or the")
+        print("        string table is obfuscated. Falling back to start-mode switches.")
+
+    print("\n[+] Recovered runtime functions (_PyRun_String / _PyRun_File):")
+    if not runtime:
+        print("    (none)")
+    for hit in runtime[:limit]:
+        print(f"    {hit.role}  VA={hex(hit.va)} RVA={hex(elf.rva(hit.va) or 0)} "
+              f"off={_hex(elf.va_to_off(hit.va))} score={hit.score}")
+        for note in verified.get(hit.va) or []:
+            print(f"      confirmed: {note}")
+        for item in hit.evidence[:6]:
+            print(f"      - {item}")
+
+    print("\n[+] PyRun_StringFlags candidates (callers passing name == NULL):")
+    if not entrypoints:
+        print("    (none)")
+    for hit in entrypoints[:limit]:
+        print(f"    {hit.role}  VA={hex(hit.va)} RVA={hex(elf.rva(hit.va) or 0)} "
+              f"off={_hex(elf.va_to_off(hit.va))} score={hit.score}")
+        for item in hit.evidence[:6]:
+            print(f"      - {item}")
+
+    if entropy_ranges:
+        print("\n[+] High-entropy ranges:")
+        for item in entropy_ranges[:10]:
+            print(f"    VA={item['va']} off={item['file_offset']} "
+                  f"H={item['entropy_bits_per_byte']}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Locate CPython PyRun_StringFlags without symbol names.")
+    parser.add_argument("so", help="target ELF shared object")
+    parser.add_argument("--window", type=int, default=28,
+                        help="accepted for backward compatibility")
+    parser.add_argument("--max-candidates", type=int, default=25)
+    parser.add_argument("--json", dest="json_path")
+    parser.add_argument("--entropy", action="store_true",
+                        help="also report sampled high-entropy ranges")
+    parser.add_argument("--deep", action="store_true",
+                        help="adds the slower 2-byte Thumb pass and capstone checks")
+    args = parser.parse_args()
+
     if not os.path.isfile(args.so):
-        ap.error(f"file not found: {args.so}")
-    t0 = time.time()
-    img = ELFImage(args.so)
-    log(f"[*] ELF loaded in {time.time()-t0:.1f}s "
-        f"({sum(len(s.data) for s in img.segments)/1e6:.1f} MB, {len(img.strings)} strings)")
-    candidates, summary = decode_analysis(img, max(8, args.window))
-    entropy_ranges = find_high_entropy_ranges(img) if args.entropy else []
-    print_report(img, candidates, summary, entropy_ranges, args.max_candidates)
+        parser.error(f"file not found: {args.so}")
+
+    started = time.time()
+    elf = ELF(args.so)
+    log(f"[*] mapped {elf.filesize / 1e6:.1f} MB in {time.time() - started:.1f}s "
+        f"({elf.bits}-bit machine={elf.machine})")
+
+    anchors = find_anchors(elf)
+    log(f"[*] anchor literals resolved in {time.time() - started:.1f}s")
+    markers = runtime_markers(elf)
+
+    targets: Set[int] = {va for anchor in anchors for va in anchor.vas}
+    scan = scan_code(elf, deep=args.deep)
+    log(f"[*] decoded {len(scan.calls)} branches, {len(scan.movw)} movw, "
+        f"{len(scan.movt)} movt in {time.time() - started:.1f}s")
+
+    xrefs = collect_xrefs(elf, targets, scan)
+    log(f"[*] {len(xrefs)} cross-references to anchor literals")
+
+    runtime, entrypoints = identify(elf, anchors, xrefs, scan, deep=args.deep)
+
+    verified: Dict[int, Optional[List[str]]] = {}
+    if args.deep:
+        anchor_vas = {va: a.needle.decode("utf-8", "replace")
+                      for a in anchors for va in a.vas}
+        for hit in list(runtime) + list(entrypoints):
+            verified[hit.va] = capstone_verify(elf, hit.va, anchor_vas)
+
+    entropy_ranges = high_entropy_ranges(elf) if args.entropy else []
+    print_report(elf, anchors, markers, runtime, entrypoints, verified,
+                 entropy_ranges, args.max_candidates)
+
     if args.json_path:
-        report = {"file": os.path.abspath(args.so), "summary": summary,
-                  "candidates": [asdict(c) for c in candidates],
-                  "high_entropy_ranges": entropy_ranges}
-        with open(args.json_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2)
+        report = {
+            "file": os.path.abspath(args.so),
+            "summary": {
+                "bits": elf.bits,
+                "endianness": "little" if elf.little else "big",
+                "machine": elf.machine,
+                "image_base": hex(elf.image_base),
+                "executable_ranges": [
+                    {"name": n, "va": hex(v), "size": s}
+                    for v, _o, s, n in elf.executable_ranges()],
+                "branch_count": len(scan.calls),
+                "start_mode_comparisons": len(scan.mode_cmps),
+                "anchor_count": sum(len(a.vas) for a in anchors),
+                "xref_count": len(xrefs),
+                "runtime_markers": markers,
+            },
+            "anchors": [
+                {"text": a.needle.decode("utf-8", "replace"), "weight": a.weight,
+                 "note": a.note, "vas": [hex(v) for v in a.vas]}
+                for a in anchors],
+            "py_functions": [hit.as_dict(elf) for hit in runtime],
+            "candidates": [hit.as_dict(elf) for hit in entrypoints],
+            "xrefs": [{"va": hex(x.va), "target": hex(x.target), "kind": x.kind,
+                       "note": x.note} for x in xrefs[:500]],
+            "high_entropy_ranges": list(entropy_ranges),
+        }
+        with open(args.json_path, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2)
         print(f"\n[+] JSON report: {args.json_path}")
-    img.close()
-    log(f"[*] Done in {time.time()-t0:.1f}s")
+
+    elf.close()
+    log(f"[*] done in {time.time() - started:.1f}s")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
+
+
