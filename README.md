@@ -21,7 +21,7 @@ Actions → **Blood Strike ABI check** → *Run workflow*.
 | input | default | meaning |
 | --- | --- | --- |
 | `chat` | `9117250551` | chat id, `@username` or `t.me` link |
-| `message` | `236` | message id holding the archive (forwarded to read its `file_id`) |
+| `message` | `241` | message id holding the archive (forwarded to read its `file_id`) |
 | `file_id` | – | use a known Telegram `file_id`, skips the message lookup |
 | `url` | – | download from any direct URL instead of Telegram |
 | `require` | `arm64-v8a,armeabi-v7a` | ABIs that must be found |
@@ -67,7 +67,7 @@ export TELEGRAM_BOT_TOKEN='<token>'
 python scripts/tg_fetch.py --chat 9117250551 --list-only --require-suffix .xapk,.zip
 
 # fetch (needs a local Bot API server for files over 20 MB)
-python scripts/tg_fetch.py --chat 9117250551 --message 236 --out-dir work
+python scripts/tg_fetch.py --chat 9117250551 --message 241 --out-dir work
 
 # unpack + check the ABIs
 python scripts/inspect_apks.py work/com.netease.newspike_*.xapk \

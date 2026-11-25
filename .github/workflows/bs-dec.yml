@@ -23,7 +23,7 @@ on:
         description: "Message id of the archive in that chat (forwarded to read its file_id)"
         required: false
         type: string
-        default: "236"
+        default: "241"
       file_id:
         description: "Telegram file_id — optional, skips the message lookup"
         required: false
