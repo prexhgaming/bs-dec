@@ -1,12 +1,8 @@
 name: Tests
 
-# Offline unit tests: no network, no Telegram, no APKPure. They build a small
-# synthetic XAPK in a temp directory and check that the unpacker/ABI verifier
-# behaves (both ABIs present -> exit 0, missing ABI -> exit 1).
-
 on:
   push:
-    branches: ["main"]
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
 
@@ -14,22 +10,41 @@ permissions:
   contents: read
 
 jobs:
-  unit:
-    name: Unit tests
+  unit-tests:
+    name: Offline unit tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
     steps:
-      - name: Check out
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run the test suite (no network needed)
+        run: python -m unittest discover -s tests -v
+
+      - name: Smoke test the CLI
+        run: |
+          python fetch_apk.py --help > /dev/null
+          python fetch_apk.py --version
+
+  resolve-smoke:
+    name: Live resolve check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only when explicitly requested: this job touches the network.
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Compile everything
-        run: python -m compileall -q scripts tests
-
-      - name: Run the tests
-        run: python -m unittest discover -s tests -v
+      - name: Resolve a known release without downloading it
+        run: |
+          python fetch_apk.py --package com.netease.newspike --version-code 169 --arch universal --mode probe

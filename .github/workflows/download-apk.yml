@@ -1,0 +1,186 @@
+name: Download APK from APKPure
+
+# Full downloads belong to CI. Locally, run --mode probe or --mode sample instead.
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Android package name
+        required: true
+        default: com.netease.newspike
+      version_code:
+        description: versionCode to fetch (leave empty for the newest)
+        required: false
+        default: "169"
+      arch:
+        description: Architecture ("all" fans out over the ABI matrix)
+        type: choice
+        options: [universal, arm64-v8a, armeabi-v7a, x86, x86_64, all]
+        default: universal
+      variant:
+        description: auto = apk for universal, splits otherwise
+        type: choice
+        options: [auto, apk, xapk, splits]
+        default: auto
+      with_base:
+        description: Also download the base APK when pulling splits
+        type: boolean
+        default: false
+      verify:
+        description: Enforce the metadata size and sha1
+        type: boolean
+        default: true
+      retention_days:
+        description: Artifact retention in days
+        required: false
+        default: "7"
+
+permissions:
+  contents: read
+
+env:
+  PACKAGE: ${{ inputs.package }}
+  VERSION_CODE: ${{ inputs.version_code }}
+  VARIANT: ${{ inputs.variant }}
+
+jobs:
+  resolve:
+    name: Resolve plan (${{ inputs.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Print the plan without transferring payload
+        run: |
+          python fetch_apk.py \
+            --package "$PACKAGE" \
+            --version-code "$VERSION_CODE" \
+            --arch "${{ inputs.arch }}" \
+            --variant "$VARIANT" \
+            ${{ inputs.with_base && '--with-base' || '' }} \
+            --mode probe \
+            --json > plan.json
+          cat plan.json > /dev/null
+
+      - name: Summarise the plan
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+
+          plan = json.load(open("plan.json"))
+          app = plan.get("app") or {}
+          print(f"## APKPure plan: `{plan['package']}`\n")
+          print(f"- app: **{app.get('app_name', 'unknown')}**")
+          print(f"- version: `{app.get('version_name', '?')}` (versionCode `{app.get('version_code', '?')}`)")
+          print(f"- arch: `{plan['arch']}` · variant: `{plan['variant']}` · mode: `{plan['mode']}`")
+          size = plan["plan"].get("total_size")
+          print(f"- payload: {size if size is None else format(size / 1048576, '.1f')} MiB across {len(plan['plan']['files'])} file(s)\n")
+          print("| role | file | size (MiB) | source |")
+          print("| --- | --- | --- | --- |")
+          for item in plan["plan"]["files"]:
+              mb = item.get("size")
+              mb = "-" if mb is None else f"{mb / 1048576:.1f}"
+              source = item.get("from_xapk_entry") or "http"
+              print(f"| {item['role']} | `{item['filename']}` | {mb} | {source} |")
+          for note in plan["plan"].get("notes", []):
+              print(f"\n> {note}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan-${{ inputs.package }}-${{ inputs.arch }}
+          path: plan.json
+          retention-days: 2
+
+  download:
+    name: Download ${{ inputs.arch != 'all' && inputs.arch || matrix.arch }}
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    concurrency:
+      group: apk-${{ inputs.package }}-${{ inputs.version_code }}-${{ inputs.arch == 'all' && matrix.arch || inputs.arch }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        # "all" fans out over the common ABIs; anything else is a single run.
+        arch: ${{ fromJSON(inputs.arch == 'all' && '["universal","arm64-v8a","armeabi-v7a"]' || format('["{0}"]', inputs.arch)) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Restore leftover .part files so an interrupted job continues instead of
+      # restarting (cache entries expire after 7 days of no access).
+      - name: Restore partial downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: downloads/**/*.part
+          key: apkpart-${{ inputs.package }}-${{ inputs.version_code }}-${{ matrix.arch }}-${{ github.run_id }}
+          restore-keys: |
+            apkpart-${{ inputs.package }}-${{ inputs.version_code }}-${{ matrix.arch }}-
+
+      - name: Download ${{ matrix.arch }} from APKPure
+        run: |
+          python fetch_apk.py \
+            --package "$PACKAGE" \
+            --version-code "$VERSION_CODE" \
+            --arch "${{ matrix.arch }}" \
+            --variant "$VARIANT" \
+            ${{ inputs.with_base && '--with-base' || '' }} \
+            --mode download \
+            --resume \
+            --retries 6 \
+            ${{ inputs.verify && '--verify' || '' }}
+
+      - name: Summarise results
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+
+          manifests = sorted(pathlib.Path("downloads").rglob("manifest.json"))
+          if not manifests:
+              print("## Download results\n\nNo manifest found — the run failed before writing one.")
+              raise SystemExit(0)
+          print("## Download results\n")
+          for path in manifests:
+              data = json.loads(path.read_text())
+              result = data.get("result", {})
+              print(f"### `{data['package']}` {data['arch']} ({data['mode']})\n")
+              print(f"- out dir: `{data['out_dir']}`")
+              print(f"- duration: {data['duration_seconds']}s\n")
+              print("| file | size (MiB) | sha1 | attempts | resumed from |")
+              print("| --- | --- | --- | --- | --- |")
+              for item in result.get("files", []):
+                  size = item.get("size") or 0
+                  print(
+                      f"| `{item['filename']}` | {size / 1048576:.1f} | "
+                      f"`{(item.get('sha1') or '-')[:16]}` | "
+                      f"{item.get('attempts', '-')} | {item.get('resumed_from', 0)} bytes |"
+                  )
+              print()
+          PY
+
+      - name: Save partial downloads for a future resume
+        if: cancelled()
+        uses: actions/cache/save@v4
+        with:
+          path: downloads/**/*.part
+          key: apkpart-${{ inputs.package }}-${{ inputs.version_code }}-${{ matrix.arch }}-${{ github.run_id }}
+
+      - name: Upload ${{ matrix.arch }} artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.package }}-${{ inputs.version_code }}-${{ matrix.arch }}
+          path: downloads/**
+          if-no-files-found: error
+          retention-days: ${{ fromJSON(inputs.retention_days) }}
+          compression-level: 0

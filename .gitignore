@@ -1,17 +1,10 @@
-# working directories produced by the scripts
-work/
-work-*/
-tmp/
+# Downloaded payloads, partial transfers and sampling leftovers
 downloads/
 *.part
+*.sample
+plan.json
 
-# python
+# Python bytecode
 __pycache__/
 *.py[cod]
-.venv/
-venv/
-
-# editors / os
-.DS_Store
-.idea/
-.vscode/
+.pytest_cache/
