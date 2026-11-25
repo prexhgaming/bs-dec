@@ -24,7 +24,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 try:
     from elftools.elf.elffile import ELFFile
-    from elftools.elf.sections import SymbolTableSection, RelocationSection
+    from elftools.elf.sections import SymbolTableSection
+    from elftools.elf.relocation import RelocationSection
     from capstone import (
         Cs, CS_ARCH_X86, CS_ARCH_ARM, CS_ARCH_ARM64,
         CS_MODE_32, CS_MODE_64, CS_MODE_ARM, CS_MODE_THUMB,
