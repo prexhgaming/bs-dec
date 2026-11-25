@@ -46,10 +46,6 @@ on:
         description: Direct archive URL; skips APKCombo scraping (use when the runner's IP is blocked)
         required: false
         default: ""
-      use_cache:
-        description: Restore the archive from an earlier run instead of downloading it again
-        required: false
-        default: "true"
   push:
     branches: [main]
     paths:
@@ -99,13 +95,12 @@ jobs:
         run: python -m compileall -q apkcombo analysis fetch_apk.py
 
       - name: Restore the cached archive
-        if: inputs.use_cache != 'false'
         uses: actions/cache@v4
         with:
           path: downloads
-          key: apk-${{ inputs.package || 'com.netease.newspike' }}-${{ inputs.variant || 'apk' }}-${{ inputs.expect_version || 'any' }}-v1
+          key: apk-v2-${{ inputs.package || 'com.netease.newspike' }}-${{ inputs.variant || 'apk' }}-${{ inputs.expect_version || 'any' }}
           restore-keys: |
-            apk-${{ inputs.package || 'com.netease.newspike' }}-${{ inputs.variant || 'apk' }}-
+            apk-v2-${{ inputs.package || 'com.netease.newspike' }}-${{ inputs.variant || 'apk' }}-
 
       - name: Resolve the archive
         run: |

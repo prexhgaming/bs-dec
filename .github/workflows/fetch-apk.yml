@@ -33,6 +33,10 @@ on:
         description: Fail unless the APKCombo page offers this version (empty = accept whatever is there)
         required: false
         default: ""
+      apk_url:
+        description: Direct archive URL; skips APKCombo scraping (use when the runner IP is blocked)
+        required: false
+        default: ""
       mode:
         description: download = full file, sample = first few MiB only, probe = resolve only
         required: true
@@ -107,13 +111,12 @@ jobs:
           df -h / | tail -1
 
       - name: Restore the cached archive
-        if: inputs.use_cache != 'false'
         uses: actions/cache@v4
         with:
           path: downloads
-          key: apk-${{ inputs.package }}-${{ inputs.variant }}-${{ inputs.expect_version || 'any' }}-v1
+          key: apk-v2-${{ inputs.package }}-${{ inputs.variant }}-${{ inputs.expect_version || 'any' }}
           restore-keys: |
-            apk-${{ inputs.package }}-${{ inputs.variant }}-
+            apk-v2-${{ inputs.package }}-${{ inputs.variant }}-
 
       - name: Fetch the APK and verify its ABIs
         shell: bash

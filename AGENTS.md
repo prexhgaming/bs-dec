@@ -32,6 +32,15 @@ App page -> `.../download/apk` page -> hidden `soqplay_download_file` token per
 variant -> POST that token (same page) -> 303 to an `apkcombo-transfer*.workers.dev`
 URL -> file. Tokens/URLs are short lived: resolve fresh every run, never cache.
 
+## CI archive cache (automatic)
+All three workflows (`fetch-apk.yml`, `scan-libs.yml`, `decompile-lib.yml`) use
+`actions/cache@v4` unconditionally on `downloads/`, keyed by
+`apk-v2-<package>-<variant>-<expect_version>`. First run downloads the whole
+archive; `actions/cache` saves it automatically at the end of the job. Later runs
+restore it and pass `--apk-file` so APKCombo is never contacted. There is no
+`use_cache` switch. If the runner IP is bot-blocked, pass `apk_url` to download
+from a direct link.
+
 ## Pitfalls
 - The APKCombo "Blood Strike x DJ SNAKE" page serves **versionCode 17** (665.78 MB),
   not the 1.003.650026/169 build installed on the device; its `libGame.so` is

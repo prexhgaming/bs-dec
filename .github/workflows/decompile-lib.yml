@@ -42,10 +42,6 @@ on:
         description: Direct archive URL; skips APKCombo scraping (use when the runner's IP is blocked)
         required: false
         default: ""
-      use_cache:
-        description: Restore the archive from an earlier run instead of downloading it again
-        required: false
-        default: "true"
       max_functions:
         description: Stop after N functions (0 = every candidate)
         required: false
@@ -128,13 +124,12 @@ jobs:
         run: python -m compileall -q apkcombo analysis fetch_apk.py
 
       - name: Restore the cached archive
-        if: inputs.use_cache == 'true'
         uses: actions/cache@v4
         with:
           path: downloads
-          key: apk-${{ inputs.package }}-${{ inputs.variant }}-${{ inputs.expect_version || 'any' }}-v1
+          key: apk-v2-${{ inputs.package }}-${{ inputs.variant }}-${{ inputs.expect_version || 'any' }}
           restore-keys: |
-            apk-${{ inputs.package }}-${{ inputs.variant }}-
+            apk-v2-${{ inputs.package }}-${{ inputs.variant }}-
 
       - name: Resolve the archive
         env:
@@ -159,12 +154,14 @@ jobs:
                    --detect-abis --require-abi "$ABI" )
             [ -n "$SLUG" ] && args+=( --slug "$SLUG" )
             [ -n "$VERSION" ] && args+=( --expect-version "$VERSION" )
-            if ! python fetch_apk.py "${args[@]}"; then
-              status=$?
-              if [ "$status" -eq 4 ]; then
-                echo "::error::APKCombo blocked this runner's IP (Cloudflare). Re-run with"
-                echo "::error::apk_url set to a direct archive link, or restore the cache."
-              fi
+            set +e
+            python fetch_apk.py "${args[@]}" 2>&1 | tee resolve.log
+            status=${PIPESTATUS[0]}
+            if [ "$status" -eq 4 ]; then
+              echo "::error::APKCombo blocked this runner's IP (Cloudflare). Re-run with"
+              echo "::error::apk_url set to a direct archive link, or restore the cache."
+            fi
+            if [ "$status" -ne 0 ]; then
               exit "$status"
             fi
           fi
