@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import zipfile
 from pathlib import Path
 
@@ -97,6 +98,33 @@ class NameAndSizeTests(unittest.TestCase):
     def test_small_file_is_fine_on_the_cloud_api(self):
         self.assertIsNone(tg.check_downloadable_size(1_048_576, "https://api.telegram.org"))
 
+    def test_blank_api_base_env_falls_back_to_the_cloud_api(self):
+        # Actions exports TELEGRAM_API_BASE="" when the local server is skipped.
+        old = os.environ.get("TELEGRAM_API_BASE")
+        os.environ["TELEGRAM_API_BASE"] = "   "
+        try:
+            self.assertEqual(tg.api_base(), tg.DEFAULT_API_BASE.rstrip("/"))
+            self.assertTrue(tg.is_cloud_api())
+        finally:
+            self._restore(old)
+
+    def test_local_api_base_env_is_used_and_trailing_slash_stripped(self):
+        old = os.environ.get("TELEGRAM_API_BASE")
+        os.environ["TELEGRAM_API_BASE"] = "http://127.0.0.1:8081/"
+        try:
+            self.assertEqual(tg.api_base(), "http://127.0.0.1:8081")
+            self.assertFalse(tg.is_cloud_api())
+            self.assertEqual(tg.file_size_limit(), tg.LOCAL_API_FILE_LIMIT)
+        finally:
+            self._restore(old)
+
+    @staticmethod
+    def _restore(old):
+        if old is None:
+            os.environ.pop("TELEGRAM_API_BASE", None)
+        else:
+            os.environ["TELEGRAM_API_BASE"] = old
+
 
 class MessageParsingTests(unittest.TestCase):
     def test_document(self):
@@ -134,6 +162,83 @@ class MessageParsingTests(unittest.TestCase):
     def test_download_url_shape(self):
         url = tg.build_download_url("documents/file_3.xapk", token="123:abc", base="http://127.0.0.1:8081")
         self.assertEqual(url, "http://127.0.0.1:8081/file/bot123:abc/documents/file_3.xapk")
+
+
+class MessageLookupTests(unittest.TestCase):
+    """forwardMessage is used instead of getUpdates, and cleaned up afterwards."""
+
+    forwarded = {
+        "message_id": 999,
+        "chat": {"id": 9117250551},
+        "document": {
+            "file_id": "BQACAgUAAxkBAA",
+            "file_unique_id": "AgADpCAAAm29QVQ",
+            "file_name": "com.netease.newspike_1.003.650026.xapk",
+            "file_size": 666668430,
+        },
+    }
+
+    def _args(self, *extra):
+        return tg_fetch.build_parser().parse_args(["--chat", "9117250551", *extra])
+
+    def test_forwarded_copy_is_deleted(self):
+        calls = []
+
+        def fake_call(method, **kwargs):
+            calls.append((method, kwargs.get("params")))
+            return dict(self.forwarded) if method == "forwardMessage" else True
+
+        with mock.patch.object(tg, "call", side_effect=fake_call):
+            remote = tg_fetch.lookup_message_file(9117250551, 236, self._args("--message", "236"), lambda _m: None)
+
+        self.assertEqual(remote.file_id, "BQACAgUAAxkBAA")
+        self.assertEqual([name for name, _ in calls], ["forwardMessage", "deleteMessage"])
+        self.assertEqual(calls[0][1]["message_id"], 236)
+        self.assertEqual(calls[1][1], {"chat_id": 9117250551, "message_id": 999})
+
+    def test_keep_forward_leaves_the_copy_alone(self):
+        calls = []
+
+        def fake_call(method, **kwargs):
+            calls.append(method)
+            return dict(self.forwarded) if method == "forwardMessage" else True
+
+        with mock.patch.object(tg, "call", side_effect=fake_call):
+            tg_fetch.lookup_message_file(9117250551, 236, self._args("--keep-forward"), lambda _m: None)
+        self.assertEqual(calls, ["forwardMessage"])
+
+    def test_a_failed_delete_is_not_fatal(self):
+        def fake_call(method, **kwargs):
+            if method == "forwardMessage":
+                return dict(self.forwarded)
+            raise tg.TelegramApiError("deleteMessage", "message can't be deleted")
+
+        with mock.patch.object(tg, "call", side_effect=fake_call):
+            remote = tg_fetch.lookup_message_file(9117250551, 236, self._args(), lambda _m: None)
+        self.assertEqual(remote.file_name, "com.netease.newspike_1.003.650026.xapk")
+
+    def test_forward_to_another_chat_is_honoured(self):
+        calls = []
+
+        def fake_call(method, **kwargs):
+            calls.append(kwargs.get("params"))
+            return dict(self.forwarded) if method == "forwardMessage" else True
+
+        with mock.patch.object(tg, "call", side_effect=fake_call):
+            tg_fetch.lookup_message_file(
+                9117250551, 236, self._args("--forward-to", "-100123"), lambda _m: None
+            )
+        self.assertEqual(calls[0]["chat_id"], "-100123")
+        self.assertEqual(calls[0]["from_chat_id"], 9117250551)
+
+    def test_message_id_parsing(self):
+        self.assertEqual(tg_fetch._message_id_from(self._args("--message", "236")), 236)
+        self.assertEqual(
+            tg_fetch._message_id_from(self._args("--message", "https://t.me/c/1234567890/77")), 77
+        )
+        self.assertIsNone(tg_fetch._message_id_from(self._args()))
+        self.assertEqual(tg_fetch._message_id_from(self._args(), fallback=5), 5)
+        self.assertIsNone(tg_fetch._message_id_from(self._args("--message", "not-a-number")))
 
 
 # ---------------------------------------------------------------------------

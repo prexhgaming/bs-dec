@@ -80,7 +80,6 @@ concurrency:
 env:
   PYTHONUNBUFFERED: "1"
   PYTHONDONTWRITEBYTECODE: "1"
-  TELEGRAM_API_BASE: ""
 
 jobs:
   unpack:
@@ -153,6 +152,7 @@ jobs:
           done
           curl -sf -o /dev/null "http://127.0.0.1:8081/" || { echo "::error::the local Bot API server did not come up"; docker logs tg-bot-api | tail -40; exit 1; }
           echo "base=http://127.0.0.1:8081" >> "$GITHUB_OUTPUT"
+          echo "TELEGRAM_API_BASE=http://127.0.0.1:8081" >> "$GITHUB_ENV"
           echo "local Bot API server is up on http://127.0.0.1:8081 (local mode, limit 2000 MB)"
 
       - name: List the archives in the chat
@@ -164,7 +164,7 @@ jobs:
           set -euo pipefail
           python scripts/tg_fetch.py \
             --chat "${{ inputs.chat }}" \
-            --list-only --scan-pages 10 --require-suffix .xapk,.zip,.apk,.7z,.rar | tee work-list.txt || true
+            --list-only --scan-pages 10 --require-suffix .xapk,.zip,.apk,.7z,.rar 2>&1 | tee work-list.txt || true
           {
             echo "## Archives visible in the chat"
             echo '```'

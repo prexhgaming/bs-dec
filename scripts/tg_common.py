@@ -82,8 +82,14 @@ class RemoteFile:
 
 
 def api_base() -> str:
-    """Bot API root. Point ``TELEGRAM_API_BASE`` at a self-hosted server for >20 MiB."""
-    return os.environ.get("TELEGRAM_API_BASE", DEFAULT_API_BASE).rstrip("/")
+    """Bot API root. Point ``TELEGRAM_API_BASE`` at a self-hosted server for >20 MiB.
+
+    Blank values are treated as unset: Actions sets the variable to an empty
+    string when the local server step is skipped, and ``""`` would otherwise
+    produce a URL with no scheme.
+    """
+    configured = (os.environ.get("TELEGRAM_API_BASE") or "").strip()
+    return (configured or DEFAULT_API_BASE).rstrip("/")
 
 
 def is_cloud_api(base: Optional[str] = None) -> bool:

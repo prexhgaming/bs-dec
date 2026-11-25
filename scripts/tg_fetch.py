@@ -72,6 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="scan getUpdates, print every document found (name, size, file_id) and stop without downloading",
     )
+    parser.add_argument(
+        "--keep-forward",
+        action="store_true",
+        help="keep the forwarded copy of the message used to read the file_id (default: delete it again)",
+    )
     parser.add_argument("--require-suffix", default=".zip", help="preferred suffix when scanning getUpdates")
     parser.add_argument("--max-size", type=int, help="refuse files larger than this many bytes")
     parser.add_argument("--allow-huge", action="store_true", help="download even when over the API limit")
@@ -89,8 +94,17 @@ def main(argv=None) -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         if args.list_only:
-            chat, _ = (tg.normalize_chat(args.chat) if args.chat else (None, None))
+            chat, link_message = (tg.normalize_chat(args.chat) if args.chat else (None, None))
             candidates = list_updates(chat, args, log)
+            if not candidates:
+                # getUpdates only carries *pending* updates and drains on read, so fall
+                # back to reading the message itself when a message id was given.
+                message_id = _message_id_from(args, link_message)
+                if chat is not None and message_id is not None:
+                    log("getUpdates returned no documents; reading the message directly instead")
+                    remote = lookup_message_file(chat, message_id, args, log)
+                    if remote is not None:
+                        candidates = [remote]
             payload = [
                 {
                     "file_id": item.file_id,
@@ -119,8 +133,6 @@ def main(argv=None) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            if args.message or args.file_id:
-                log("note: --list-only ignores --message/--file-id")
             return 0
 
         if args.url:
@@ -195,6 +207,52 @@ def main(argv=None) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _message_id_from(args, fallback=None):
+    """Read the message id out of ``--message`` (a bare id or a t.me link)."""
+    value = (args.message or "").strip()
+    if not value:
+        return fallback
+    if re.match(r"^(https?://)?t\.me/", value, re.I):
+        return tg.normalize_chat(value)[1]
+    return int(value) if re.fullmatch(r"-?\d+", value) else None
+
+
+def lookup_message_file(chat, message_id, args, log):
+    """Resolve the document of an existing message.
+
+    The file_id is read through ``forwardMessage`` because it works on chat
+    history, unlike ``getUpdates`` which consumes the updates it returns. The
+    forwarded copy is deleted again so the chat is left as it was.
+    """
+    target = args.forward_to or chat
+    log(f"forwarding message {message_id} from chat {chat} to read its file_id")
+    forwarded = tg.call(
+        "forwardMessage",
+        token=args.token,
+        base=args.api_base,
+        log=log,
+        params={
+            "chat_id": target,
+            "from_chat_id": chat,
+            "message_id": message_id,
+            "disable_notification": True,
+        },
+    )
+    copy_id = forwarded.get("message_id")
+    if copy_id and not args.keep_forward:
+        try:
+            tg.call(
+                "deleteMessage",
+                token=args.token,
+                base=args.api_base,
+                params={"chat_id": target, "message_id": copy_id},
+            )
+            log(f"deleted the forwarded copy (message {copy_id})")
+        except tg.TelegramApiError as exc:
+            log(f"note: could not delete the forwarded copy {copy_id}: {exc}")
+    return tg.file_from_message(forwarded)
+
+
 def resolve_remote_file(args, log) -> Tuple[tg.RemoteFile, str]:
     """Find the file to download, trying the cheap routes before scanning."""
     if args.file_id:
@@ -217,20 +275,7 @@ def resolve_remote_file(args, log) -> Tuple[tg.RemoteFile, str]:
         message_id = link_message
 
     if chat is not None and message_id is not None:
-        log(f"forwarding message {message_id} from chat {chat} to read its file_id")
-        forwarded = tg.call(
-            "forwardMessage",
-            token=args.token,
-            base=args.api_base,
-            log=log,
-            params={
-                "chat_id": args.forward_to or chat,
-                "from_chat_id": chat,
-                "message_id": message_id,
-                "disable_notification": True,
-            },
-        )
-        remote = tg.file_from_message(forwarded)
+        remote = lookup_message_file(chat, message_id, args, log)
         if remote is not None:
             return remote, f"forwarded message {message_id}"
         raise tg.TelegramError(
