@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 DEFAULT_API_BASE = "https://api.telegram.org"
@@ -431,6 +432,41 @@ def iter_updates(
         # Walk to the oldest batch: getUpdates(offset=0) returns the oldest
         # pending updates, so raising the offset keeps paging forward in time.
         seen_offset = max(_as_int(item.get("update_id")) or 0 for item in updates) + 1
+
+
+def map_local_file(
+    file_path: Optional[str],
+    *,
+    host_dir: Optional[str] = None,
+    container_dir: Optional[str] = None,
+) -> Optional[Path]:
+    """Resolve a ``getFile`` file_path to a readable file on *this* machine.
+
+    A Bot API server running in ``--local`` mode returns the absolute path of the
+    file on the server's disk instead of an HTTP path, so the file can be copied
+    locally instead of being transferred a second time over HTTP. When that server
+    runs in a container, the path points *inside* it; ``host_dir``/``container_dir``
+    say how that directory is mounted here. ``None`` means "not readable" — the
+    caller then falls back to downloading through the API.
+    """
+    if not file_path:
+        return None
+    raw = str(file_path)
+    candidates: List[Path] = []
+    prefix = (container_dir or "").rstrip("/")
+    if prefix and (raw == prefix or raw.startswith(prefix + "/")):
+        relative = raw[len(prefix):].lstrip("/")
+        if host_dir and relative:
+            candidates.append(Path(host_dir) / relative)
+    if raw.startswith("/"):
+        candidates.append(Path(raw))
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 def _as_int(value: Any) -> Optional[int]:

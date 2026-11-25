@@ -62,6 +62,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sha256", help="expected sha256 of the assembled file (parts mode)")
     parser.add_argument("--keep-parts", action="store_true", help="keep the downloaded part files")
+    parser.add_argument(
+        "--local-data-dir",
+        help="host directory holding the self-hosted Bot API server's files. With it, the copy "
+        "getFile already put on disk is used instead of downloading the file over HTTP again.",
+    )
+    parser.add_argument(
+        "--local-data-dir-in-container",
+        default="/var/lib/telegram-bot-api",
+        help="that directory's path inside the server container (default: /var/lib/telegram-bot-api)",
+    )
     parser.add_argument("--url", help="download directly from this URL instead of Telegram")
     parser.add_argument(
         "--forward-to",
@@ -167,19 +177,15 @@ def main(argv=None) -> int:
                     f"({tg.describe_size(args.max_size)})"
                 )
 
-            file_path = _resolve_file_path(remote.file_id, args)
-            url = tg.build_download_url(file_path, token=args.token, base=args.api_base)
             name = args.name or remote.file_name or DEFAULT_NAME
-            log(f"downloading {name} from Telegram")
-            target, size, sha256, _ = download_url(
-                url,
-                out_dir / tg.sanitize_name(name),
-                timeout=args.timeout,
-                retries=args.retries,
-                log=log,
-                expected_size=remote.file_size,
-                max_size=args.max_size,
-            )
+            target_name = out_dir / tg.sanitize_name(name)
+            log(f"fetching {name} from Telegram")
+            target, size, sha256, how, file_path = _fetch_remote_file(remote, target_name, args, log)
+            if args.sha256 and args.sha256.strip().lower() != sha256:
+                _cleanup(target)
+                raise tg.TelegramError(
+                    f"sha256 mismatch: got {sha256}, expected {args.sha256.strip().lower()}"
+                )
             record = _record(
                 target,
                 size,
@@ -187,11 +193,13 @@ def main(argv=None) -> int:
                 origin,
                 {
                     "kind": "telegram",
+                    "transfer": how,
                     "file_id": remote.file_id,
                     "file_unique_id": remote.file_unique_id,
                     "chat_id": remote.chat_id,
                     "message_id": remote.message_id,
                     "declared_size": remote.file_size,
+                    "file_path": file_path if how == "local-path" else None,
                 },
             )
 
@@ -299,17 +307,7 @@ def fetch_parts(args, out_dir: Path, log) -> Dict[str, object]:
             remote.file_name or f"part{index:03d}", default=f"part{index:03d}"
         )
         dest = parts_dir / f"{index:03d}-{name}"
-        file_path = _resolve_file_path(remote.file_id, args)
-        url = tg.build_download_url(file_path, token=args.token, base=args.api_base)
-        path, size, sha256, _ = download_url(
-            url,
-            dest,
-            timeout=args.timeout,
-            retries=args.retries,
-            log=log,
-            expected_size=remote.file_size,
-            max_size=args.max_size,
-        )
+        path, size, sha256, how, _file_path = _fetch_remote_file(remote, dest, args, log)
         downloaded.append(
             {
                 "message_id": message_id,
@@ -317,6 +315,7 @@ def fetch_parts(args, out_dir: Path, log) -> Dict[str, object]:
                 "name": path.name,
                 "size": size,
                 "sha256": sha256,
+                "transfer": how,
             }
         )
         total += size
@@ -488,6 +487,89 @@ def _resolve_file_path(file_id: str, args) -> str:
     if not result or not result.get("file_path"):
         raise tg.TelegramError(f"getFile returned no file_path for file_id {file_id!r}")
     return str(result["file_path"])
+
+
+def copy_local_file(src: Path, dest: Path, *, log=None, prefer_hardlink: bool = True) -> Tuple[Path, int, str]:
+    """Copy a file the Bot API server already wrote to disk, returning ``(path, size, sha256)``.
+
+    A hard link is tried first because it is instant and costs no extra disk space
+    when the server's directory and the output directory share a filesystem; the
+    fallback is a plain copy. Either way the bytes are read once to hash them.
+    """
+    note = log or (lambda _message: None)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging = dest.with_name(dest.name + ".part")
+
+    linked = False
+    if prefer_hardlink:
+        try:
+            os.link(src, staging)
+            linked = True
+        except OSError as exc:
+            note(f"hard link not possible ({exc.__class__.__name__}), copying instead")
+    if not linked:
+        with open(src, "rb") as read_handle, open(staging, "wb") as write_handle:
+            while True:
+                chunk = read_handle.read(CHUNK)
+                if not chunk:
+                    break
+                write_handle.write(chunk)
+
+    digest = hashlib.sha256()
+    size = 0
+    with open(staging, "rb") as handle:
+        while True:
+            chunk = handle.read(CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+    os.replace(staging, dest)
+    return dest, size, digest.hexdigest()
+
+
+def _fetch_remote_file(remote, dest: Path, args, log) -> Tuple[Path, int, str, str, str]:
+    """Get one Telegram document onto disk: local copy when possible, else HTTP.
+
+    Returns ``(path, size, sha256, how, file_path)`` where ``how`` is
+    ``"local-path"`` (read from the local Bot API server's own directory) or
+    ``"http"``, and ``file_path`` is what ``getFile`` answered.
+    """
+    file_path = _resolve_file_path(remote.file_id, args)
+    local = tg.map_local_file(
+        file_path,
+        host_dir=args.local_data_dir,
+        container_dir=args.local_data_dir_in_container,
+    )
+    if local is not None:
+        log(f"local Bot API mode: copying the server's file {local}")
+        try:
+            path, size, sha256 = copy_local_file(local, dest, log=log)
+        except OSError as exc:
+            log(f"cannot read {local} ({exc}); falling back to an HTTP download")
+        else:
+            if args.max_size and size > args.max_size:
+                raise tg.TelegramError(
+                    f"file is {tg.describe_size(size)}, above the "
+                    f"{tg.describe_size(args.max_size)} limit"
+                )
+            if remote.file_size and size != remote.file_size:
+                raise tg.TelegramError(
+                    f"size mismatch: local copy is {size} bytes, Telegram reports {remote.file_size}"
+                )
+            return path, size, sha256, "local-path", file_path
+
+    url = tg.build_download_url(file_path, token=args.token, base=args.api_base)
+    path, size, sha256, _ = download_url(
+        url,
+        dest,
+        timeout=args.timeout,
+        retries=args.retries,
+        log=log,
+        expected_size=remote.file_size,
+        max_size=args.max_size,
+    )
+    return path, size, sha256, "http", file_path
 
 
 # ---------------------------------------------------------------------------
