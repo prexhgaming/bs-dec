@@ -27,11 +27,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyelftools capstone
 
-      - name: Verify files
-        run: |
-          test -f pyrun_locator.py
-          test -f libgame.so
-
+      
       - name: Analyze library
         run: |
           python pyrun_locator.py libgame.so \
