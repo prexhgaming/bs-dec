@@ -15,3 +15,6 @@ SHA256SUMS.txt
 
 # agent tooling metadata
 .polydev/
+
+# transient uploads (CI artifacts pasted back into the workspace)
+uploads/
