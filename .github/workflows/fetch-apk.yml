@@ -1,0 +1,181 @@
+name: Fetch APK from APKCombo
+
+# Pulls the Blood Strike (com.netease.newspike) universal APK from APKCombo's
+# public download flow and fails unless every requested architecture is really
+# inside the archive. The ABI decision is read from the zip index (a few KiB of
+# ranged reads), never from what the page claims.
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Application id
+        required: true
+        default: com.netease.newspike
+      slug:
+        description: APKCombo page slug (empty = look it up from the package)
+        required: false
+        default: blood-strike-x-dj-snake
+      variant:
+        description: Which offered file to pull
+        required: true
+        type: choice
+        options:
+          - apk
+          - xapk
+          - auto
+        default: apk
+      require_abi:
+        description: Comma separated ABIs that must exist inside the file
+        required: true
+        default: arm64-v8a,armeabi-v7a
+      mode:
+        description: download = full file, sample = first few MiB only, probe = resolve only
+        required: true
+        type: choice
+        options:
+          - download
+          - sample
+          - probe
+        default: download
+      verify_page_sha256:
+        description: Also check the file against the SHA-256 published on the APKCombo page
+        required: true
+        type: boolean
+        default: true
+      extract_abi:
+        description: After the download, also write the base + this ABI's splits (e.g. arm64-v8a)
+        required: false
+        default: ""
+      upload_artifact:
+        description: Upload the downloaded file as a workflow artifact
+        required: true
+        type: boolean
+        default: true
+      retention_days:
+        description: Artifact retention in days
+        required: true
+        type: number
+        default: 7
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show the request
+        env:
+          PKG: ${{ inputs.package }}
+          SLUG: ${{ inputs.slug }}
+          VARIANT: ${{ inputs.variant }}
+          ABIS: ${{ inputs.require_abi }}
+          MODE: ${{ inputs.mode }}
+          PAGE_SHA: ${{ inputs.verify_page_sha256 }}
+          EXTRACT: ${{ inputs.extract_abi }}
+        run: |
+          {
+            echo "### Request"
+            echo ""
+            echo "| input | value |"
+            echo "| --- | --- |"
+            echo "| package | \`$PKG\` |"
+            echo "| slug | \`$SLUG\` |"
+            echo "| variant | \`$VARIANT\` |"
+            echo "| mode | \`$MODE\` |"
+            echo "| required ABIs | \`$ABIS\` |"
+            echo "| verify page sha256 | \`$PAGE_SHA\` |"
+            echo "| extract ABI | \`$EXTRACT\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          df -h / | tail -1
+
+      - name: Fetch the APK and verify its ABIs
+        shell: bash
+        env:
+          PKG: ${{ inputs.package }}
+          SLUG: ${{ inputs.slug }}
+          VARIANT: ${{ inputs.variant }}
+          ABIS: ${{ inputs.require_abi }}
+          MODE: ${{ inputs.mode }}
+          PAGE_SHA: ${{ inputs.verify_page_sha256 }}
+          EXTRACT: ${{ inputs.extract_abi }}
+        run: |
+          set -o pipefail
+          args=( -p "$PKG" --variant "$VARIANT" --mode "$MODE" --out-dir downloads --detect-abis )
+          [ -n "$SLUG" ] && args+=( --slug "$SLUG" )
+          [ -n "$ABIS" ] && args+=( --require-abi "$ABIS" )
+          [ "$PAGE_SHA" = "true" ] && args+=( --use-page-sha256 )
+          [ -n "$EXTRACT" ] && args+=( --extract-abi "$EXTRACT" )
+          echo "\$ python fetch_apk.py ${args[*]}"
+          python fetch_apk.py "${args[@]}" 2>&1 | tee fetch.log
+          status=${PIPESTATUS[0]}
+          {
+            echo "## fetch_apk.py said"
+            echo ""
+            echo '```'
+            tail -n 45 fetch.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+
+      - name: List the downloaded files
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -d downloads ]; then
+            echo "no downloads directory" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          ls -l downloads || true
+          : > SHA256SUMS.txt
+          for f in downloads/*.apk downloads/*.xapk; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" >> SHA256SUMS.txt
+          done
+          {
+            echo "### Files"
+            echo ""
+            echo '```'
+            ls -l downloads
+            cat SHA256SUMS.txt 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Independent ABI listing (unzip)
+        if: always()
+        shell: bash
+        run: |
+          # A second, independent opinion on the ABIs: the zip tool itself.
+          # For a plain APK the native libraries live right in lib/<abi>/.
+          for f in downloads/*.apk; do
+            [ -f "$f" ] || continue
+            echo "== $(basename "$f")"
+            echo "   (a bundle keeps them inside its nested APKs, so an empty list here is expected for .xapk)"
+            unzip -l "$f" 2>/dev/null | awk '{print $4}' | grep -oE '^lib/[^/]+/' | sort | uniq -c | sed 's/^/   /' || true
+          done
+
+      - name: Upload the APK
+        if: ${{ always() && inputs.upload_artifact }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bloodstrike-apk
+          path: |
+            downloads/*.apk
+            downloads/*.xapk
+            downloads/*-arm64-v8a/**
+            SHA256SUMS.txt
+            fetch.log
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: ${{ inputs.retention_days }}

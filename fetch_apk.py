@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Thin entry point: ``python fetch_apk.py --help``.
+"""Entry point for the APKCombo fetcher.
 
-The implementation lives in the :mod:`apkpure` package; this script only adds
-the repository root to ``sys.path`` so the tool works without installation.
+    python fetch_apk.py --package com.netease.newspike --mode probe --detect-abis
+    python fetch_apk.py --package com.netease.newspike --mode download --require-abi arm64-v8a
+
+Run ``python fetch_apk.py --help`` for every option.
 """
 
 from __future__ import annotations
 
-import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from apkpure.cli import main  # noqa: E402  (import after sys.path tweak)
+from apkcombo.cli import main
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -8,3 +8,10 @@ plan.json
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# CI run leftovers
+fetch.log
+SHA256SUMS.txt
+
+# agent tooling metadata
+.polydev/

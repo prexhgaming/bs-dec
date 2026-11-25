@@ -1,25 +1,26 @@
-"""Random-access reading of a zip archive that lives on an HTTP server.
+"""Random-access reading of a zip archive that lives behind an HTTP URL.
 
-APKPure serves split-APK bundles as ``.xapk`` files, which are ordinary zips: the
-central directory sits at the end of the file and every entry is addressed by
-absolute offset. Local headers and the tail index are a few KiB in total, so a
-tool can enumerate the per-architecture splits and then fetch exactly one of
-them with a single ranged request instead of pulling the whole (often 600 MB+)
-bundle.
+An ``.apk`` and an ``.xapk`` are both ordinary zips: the central directory sits
+at the end of the file and every member is addressed by absolute offset. Local
+headers plus the tail index are a few KiB in total, so a tool can enumerate what
+is inside a 700 MB archive — and then pull exactly one member — with a handful of
+ranged requests instead of the whole file.
+
+That is how :mod:`apkcombo.abis` answers "which CPU architectures does this build
+contain?" in a second or two.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import struct
-import time
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
-from . import transport
-from .downloader import DownloadResult, Progress, download, hash_bytes
+from . import http
 from .errors import VerificationError, ZipIndexError, describe_exception
 
 EOCD_SIGNATURE = b"PK\x05\x06"
@@ -31,13 +32,15 @@ EOCD_SEARCH_SIZE = 65536 + EOCD_MIN_SIZE
 ZIP64_MARKER = 0xFFFFFFFF
 MAX_CENTRAL_DIRECTORY = 64 << 20
 MAX_INFLATE_BUFFER = 320 << 20
+EXTRACT_CHUNK = 1 << 20
 
+#: ``reader(start, end)`` returns the inclusive byte range; injectable for tests.
 Reader = Callable[[int, int], bytes]
 
 
 @dataclass(frozen=True)
 class ZipEntry:
-    """One member of a remote zip archive."""
+    """One member of the archive."""
 
     name: str
     method: int
@@ -55,25 +58,30 @@ class ZipEntry:
         return self.method == 8
 
     @property
-    def ratio(self) -> float:
-        if not self.uncompressed_size:
-            return 0.0
-        return self.compressed_size / self.uncompressed_size
+    def compression(self) -> str:
+        return {0: "store", 8: "deflate"}.get(self.method, f"method {self.method}")
 
     def describe(self) -> str:
-        compression = {0: "store", 8: "deflate"}.get(self.method, f"method {self.method}")
         return (
-            f"{self.name} ({compression}, {transport.human_size(self.uncompressed_size)}, "
+            f"{self.name} ({self.compression}, {http.human_size(self.uncompressed_size)}, "
             f"offset {self.local_header_offset})"
         )
 
 
-class RemoteZip:
-    """Zip archive reader backed by ranged HTTP reads.
+def local_file_reader(path: os.PathLike) -> Reader:
+    """A reader over a local file, so the same code paths can run offline."""
+    handle = open(path, "rb")
 
-    ``reader`` can be injected to make the class testable offline, or to serve
-    the archive from a local file instead of the network.
-    """
+    def read(start: int, end: int) -> bytes:
+        handle.seek(start)
+        return handle.read(end - start + 1)
+
+    read.close = handle.close  # type: ignore[attr-defined]
+    return read
+
+
+class RemoteZip:
+    """Zip archive reader backed by ranged reads."""
 
     def __init__(
         self,
@@ -81,10 +89,10 @@ class RemoteZip:
         *,
         size: Optional[int] = None,
         headers: Optional[Dict[str, str]] = None,
-        timeout: float = transport.DEFAULT_TIMEOUT,
+        timeout: float = http.DEFAULT_TIMEOUT,
+        retries: int = http.DEFAULT_RETRIES,
         reader: Optional[Reader] = None,
-        log: Optional[Callable[[str], None]] = None,
-        retries: int = 4,
+        log: Optional[http.Log] = None,
     ) -> None:
         self.url = url
         self.headers = headers
@@ -95,13 +103,15 @@ class RemoteZip:
         self._size = size
         self._entries: Optional[List[ZipEntry]] = None
 
-    # -- basic properties --------------------------------------------------
+    # -- basics ------------------------------------------------------------
     @property
     def size(self) -> int:
         if self._size is None:
-            info = transport.probe(self.url, headers=self.headers, timeout=self.timeout, sample=16)
+            info, _head = http.probe(
+                self.url, sample=1, headers=self.headers, timeout=self.timeout, log=self.log
+            )
             if info.size is None:
-                raise ZipIndexError(f"cannot determine size of {self.url}")
+                raise ZipIndexError(f"cannot determine the size of {self.url}")
             self._size = info.size
         return self._size
 
@@ -133,20 +143,22 @@ class RemoteZip:
     def _load_central_directory(self) -> List[ZipEntry]:
         total = self.size
         if total < EOCD_MIN_SIZE:
-            raise ZipIndexError("remote file is too small to be a zip archive")
+            raise ZipIndexError("the remote file is too small to be a zip archive")
         window_start = max(0, total - EOCD_SEARCH_SIZE)
         tail = self._read(window_start, total - 1)
         offset = tail.rfind(EOCD_SIGNATURE)
         if offset < 0:
-            raise ZipIndexError("zip end-of-central-directory record not found")
+            raise ZipIndexError(
+                "no zip end-of-central-directory record: the file is not a zip archive"
+            )
         if len(tail) - offset < EOCD_MIN_SIZE:
-            raise ZipIndexError("zip end-of-central-directory record is truncated")
+            raise ZipIndexError("the zip end-of-central-directory record is truncated")
 
         (
             _signature,
             _disk_number,
             _cd_disk,
-            _entries_this_disk,
+            _entries_here,
             entry_count,
             cd_size,
             cd_offset,
@@ -154,15 +166,16 @@ class RemoteZip:
         ) = struct.unpack("<4sHHHHIIH", tail[offset:offset + EOCD_MIN_SIZE])
 
         if cd_offset == ZIP64_MARKER or cd_size == ZIP64_MARKER:
-            raise ZipIndexError(
-                "zip64 archives are not supported (offset/size marker found)"
-            )
+            raise ZipIndexError("zip64 archives are not supported")
         if cd_size > MAX_CENTRAL_DIRECTORY:
             raise ZipIndexError(f"central directory is implausibly large ({cd_size} bytes)")
         if cd_offset + cd_size > total:
-            raise ZipIndexError("central directory lies outside the remote file")
+            raise ZipIndexError("the central directory lies outside the remote file")
 
-        self.log(f"index: {entry_count} entries, {transport.human_size(cd_size)} at offset {cd_offset}")
+        self.log(
+            f"index: {entry_count} entries, {http.human_size(cd_size)} at offset {cd_offset} "
+            f"of a {http.human_size(total)} archive"
+        )
         blob = self._read(cd_offset, cd_offset + cd_size - 1)
         entries: List[ZipEntry] = []
         position = 0
@@ -187,13 +200,12 @@ class RemoteZip:
                 _external_attr,
                 local_offset,
             ) = header
-            name_start = position + 46
-            name_end = name_start + name_length
+            name_end = position + 46 + name_length
             if name_end > len(blob):
-                raise ZipIndexError("central directory entry runs past the end of the index")
-            name = blob[name_start:name_end].decode("utf-8", "replace")
-            if uncompressed_size == ZIP64_MARKER or compressed_size == ZIP64_MARKER:
-                raise ZipIndexError(f"zip64 entry is not supported: {name}")
+                raise ZipIndexError("a central directory entry runs past the end of the index")
+            name = blob[position + 46:name_end].decode("utf-8", "replace")
+            if compressed_size == ZIP64_MARKER or uncompressed_size == ZIP64_MARKER:
+                raise ZipIndexError(f"zip64 entries are not supported ({name})")
             entries.append(
                 ZipEntry(
                     name=name,
@@ -207,95 +219,89 @@ class RemoteZip:
             position = name_end + extra_length + comment_length
 
         if not entries:
-            raise ZipIndexError("central directory contains no entries")
+            raise ZipIndexError("the central directory contains no entries")
         return entries
 
     # -- payload -----------------------------------------------------------
     def data_offset(self, entry: ZipEntry) -> int:
-        """Absolute offset of an entry's payload (after the local header)."""
-        header = self._read(entry.local_header_offset, entry.local_header_offset + LOCAL_HEADER_SIZE - 1)
+        header = self._read(
+            entry.local_header_offset, entry.local_header_offset + LOCAL_HEADER_SIZE - 1
+        )
         if header[:4] != LOCAL_SIGNATURE:
-            raise ZipIndexError(f"local header of {entry.name} is not a zip local file header")
+            raise ZipIndexError(f"the local header of {entry.name} is not a zip local file header")
         name_length, extra_length = struct.unpack("<HH", header[26:30])
         return entry.local_header_offset + LOCAL_HEADER_SIZE + name_length + extra_length
 
     def read(self, entry: ZipEntry, *, max_bytes: int = MAX_INFLATE_BUFFER) -> bytes:
-        """Read and (if needed) inflate an entry fully into memory."""
+        """Read one member fully (bounded, so a mistake cannot eat all memory)."""
         if entry.uncompressed_size > max_bytes:
             raise ZipIndexError(
                 f"{entry.name} is too large to read into memory "
-                f"({transport.human_size(entry.uncompressed_size)})"
+                f"({http.human_size(entry.uncompressed_size)})"
             )
         start = self.data_offset(entry)
         raw = self._read(start, start + entry.compressed_size - 1)
+        if entry.is_stored:
+            return raw
         if entry.is_deflated:
             return zlib.decompressobj(-15).decompress(raw, entry.uncompressed_size)
-        if not entry.is_stored:
-            raise ZipIndexError(f"unsupported compression method {entry.method} for {entry.name}")
-        return raw
+        raise ZipIndexError(f"unsupported compression method {entry.method} for {entry.name}")
 
     def extract(
         self,
         entry: ZipEntry,
         dest: os.PathLike,
         *,
-        resume: bool = False,
         verify_crc: bool = True,
-        progress: Optional[Progress] = None,
-        timeout: Optional[float] = None,
-        retries: Optional[int] = None,
-        log: Optional[Callable[[str], None]] = None,
-    ) -> DownloadResult:
-        """Write one entry to ``dest``, pulling only that entry's byte range.
+        log: Optional[http.Log] = None,
+    ) -> Tuple[Path, int, str]:
+        """Write one member to ``dest``, downloading only that member's bytes.
 
-        Returns the same :class:`~apkpure.downloader.DownloadResult` a plain
-        download produces, so callers get sizes, hashes and resume information
-        regardless of how the file was obtained.
+        Returns ``(path, size, sha256)``. Also validates the CRC32 stored in the
+        index, so a truncated ranged read cannot pass silently.
         """
+        logger = log or (lambda _message: None)
         destination = Path(dest)
+        destination.parent.mkdir(parents=True, exist_ok=True)
         start = self.data_offset(entry)
-        end = start + entry.compressed_size - 1
+        digest = hashlib.sha256()
+        crc = 0
+        written = 0
 
         if entry.is_stored:
-            result = download(
-                self.url,
-                destination,
-                headers=self.headers,
-                byte_range=(start, end),
-                expected_size=entry.uncompressed_size,
-                resume=resume,
-                timeout=timeout or self.timeout,
-                retries=retries if retries is not None else self.retries,
-                progress=progress,
-                log=log,
-            )
+            with open(destination, "wb") as handle:
+                position = start
+                end = start + entry.compressed_size - 1
+                while position <= end:
+                    stop = min(position + EXTRACT_CHUNK - 1, end)
+                    chunk = self._read(position, stop)
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    crc = zlib.crc32(chunk, crc)
+                    written += len(chunk)
+                    position = stop + 1
         elif entry.is_deflated:
-            started = time.monotonic()
-            if progress is not None:
-                progress.total = entry.uncompressed_size
-                progress.done = 0
-            payload = self.read(entry)
-            destination.parent.mkdir(parents=True, exist_ok=True)
+            raw = self.read(entry)
+            payload = raw
+            logger(f"inflating {entry.name} ({http.human_size(len(raw))} compressed)")
             with open(destination, "wb") as handle:
                 handle.write(payload)
-            if progress is not None:
-                progress.done = len(payload)
-                progress.finish(f"{transport.human_size(len(payload))} inflated")
-            result = DownloadResult(
-                path=destination,
-                hashes=hash_bytes(payload),
-                url=self.url,
-                elapsed=max(time.monotonic() - started, 1e-6),
-            )
+            digest.update(payload)
+            crc = zlib.crc32(payload, crc)
+            written = len(payload)
         else:
             raise ZipIndexError(f"unsupported compression method {entry.method} for {entry.name}")
 
-        if verify_crc and int(result.hashes.crc32, 16) != entry.crc32:
+        if verify_crc and (crc & 0xFFFFFFFF) != entry.crc32:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
             raise VerificationError(
-                f"crc32 mismatch for {entry.name}: got {result.hashes.crc32}, "
+                f"crc32 mismatch for {entry.name}: got {crc & 0xFFFFFFFF:08x}, "
                 f"expected {entry.crc32:08x}"
             )
-        return result
+        return destination, written, digest.hexdigest()
 
     # -- transport ---------------------------------------------------------
     def _read(self, start: int, end: int) -> bytes:
@@ -303,27 +309,17 @@ class RemoteZip:
             return b""
         if self._reader is not None:
             return self._reader(start, end)
-
-        last: Optional[BaseException] = None
-        for attempt in range(1, max(self.retries, 1) + 1):
-            try:
-                return transport.read_range(self.url, start, end, headers=self.headers, timeout=self.timeout)
-            except Exception as exc:  # noqa: BLE001 - retried below
-                last = exc
-                if attempt >= max(self.retries, 1):
-                    break
-                self.log(f"range read {start}-{end} failed ({describe_exception(exc)}), retrying")
-        assert last is not None
-        raise ZipIndexError(f"cannot read bytes {start}-{end} of {self.url}: {describe_exception(last)}")
-
-
-def local_file_reader(path: os.PathLike) -> Tuple[Reader, int]:
-    """Build a :class:`RemoteZip` reader over a local file (used by tests)."""
-
-    def reader(start: int, end: int) -> bytes:
-        with open(path, "rb") as handle:
-            handle.seek(start)
-            return handle.read(end - start + 1)
-
-    size = os.path.getsize(path)
-    return reader, size
+        try:
+            return http.read_range(
+                self.url,
+                start,
+                end,
+                headers=self.headers,
+                timeout=self.timeout,
+                retries=self.retries,
+                log=self.log,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalised for the caller
+            raise ZipIndexError(
+                f"cannot read bytes {start}-{end} of {self.url}: {describe_exception(exc)}"
+            ) from exc
