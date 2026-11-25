@@ -483,7 +483,8 @@ def _scan_thumb2(elf: ELF, data: bytes, base: int, scan: CodeScan,
         elif op == 0xF2C0:                                         # MOVT
             scan.movt.append((site, rd, ((hw1 & 0xF) << 12) | imm12))
         elif op == 0xF1B0 and (hw2 & 0x0F00) == 0x0F00:            # CMP Rn, #const
-            scan.mode_cmps.append((site, hw1 & 0xF, const))
+            if const in START_MODES:
+                scan.mode_cmps.append((site, hw1 & 0xF, const))
         elif op == 0xF1A0:                                         # SUB Rd, Rn, #const
             scan.sub_imm.append((site, rd, hw1 & 0xF, const))
         elif (hw1 & 0xFFF0) == 0xF200 and (hw1 & 0xF) == 0xF:      # ADR.W Rd, #const
@@ -718,14 +719,22 @@ def identify(elf: ELF, anchor_by_va: Dict[int, Anchor], xrefs: Sequence[Xref],
                     f"sub r{rd}, r{rn}, #256 ; cmp r{rd}, #{imm}")
                 break
 
+    switch_only: List[FunctionHit] = []
     for fn, notes in switch_by_fn.items():
         hit = next((h for h in runtime if h.va == fn), None)
-        if hit is None:
-            hit = FunctionHit(fn, "_PyRun_String / _PyRun_File", 0)
-            runtime.append(hit)
-        hit.score += 30
-        hit.mode_cmps = [MODE_SINGLE]
-        hit.evidence.extend(notes[:2])
+        if hit is not None:                       # corroborates an anchored hit
+            hit.score += 30
+            hit.mode_cmps = [MODE_SINGLE]
+            hit.evidence.extend(notes[:2])
+        else:
+            switch_only.append(FunctionHit(
+                fn, "_PyRun_String (switch-only, low confidence)", 10,
+                evidence=notes[:2]))
+
+    anchored = [h for h in runtime if h.score > 0]
+    # A lone `cmp rN, #256` is an extremely common constant test, so switch-only
+    # hits are only reported when nothing anchored on a CPython literal at all.
+    runtime = anchored if anchored else switch_only[:25]
 
     runtime.sort(key=lambda h: -h.score)
 
