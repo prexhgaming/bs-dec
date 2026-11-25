@@ -636,6 +636,11 @@ def prologue_before(elf: ELF, addr: int, max_back: int = PROLOGUE_SCAN) -> Optio
 
 
 # ------------------------------------------------------------------ identification
+# Anchors that belong specifically to the PyRun_String code path.  "__name__",
+# "Traceback ..." and "importlib._bootstrap" are referenced from plenty of other
+# CPython functions, so they must not define what counts as the runtime body.
+SPECIFIC_ANCHORS = frozenset({"<string>", "invalid start argument"})
+
 FUNCTION_SPAN = 0x2000      # how far past a function start we attribute evidence
 NAME_ARG_REG = {EM_ARM: 1, EM_AARCH64: 1, EM_X86_64: 1, EM_386: 1}
 
@@ -755,7 +760,10 @@ def identify(elf: ELF, anchor_by_va: Dict[int, Anchor], xrefs: Sequence[Xref],
     runtime.sort(key=lambda h: -h.score)
 
     # PyRun_StringFlags is the unique caller of _PyRun_String that passes name=NULL.
-    runtime_vas = {h.va for h in runtime}
+    # Only the specific anchors define the runtime body; otherwise a caller of any
+    # "__name__"-touching function would be reported as the flag entrypoint.
+    specific = [h for h in runtime if any(a in SPECIFIC_ANCHORS for a in h.anchors)]
+    runtime_vas = {h.va for h in (specific or runtime)}
     callers: Dict[int, List[int]] = {}
     for site, target in scan.calls:
         if target in runtime_vas:
