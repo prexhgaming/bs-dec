@@ -32,14 +32,38 @@ App page -> `.../download/apk` page -> hidden `soqplay_download_file` token per
 variant -> POST that token (same page) -> 303 to an `apkcombo-transfer*.workers.dev`
 URL -> file. Tokens/URLs are short lived: resolve fresh every run, never cache.
 
-## CI archive cache (automatic)
-All three workflows (`fetch-apk.yml`, `scan-libs.yml`, `decompile-lib.yml`) use
-`actions/cache@v4` unconditionally on `downloads/`, keyed by
-`apk-v2-<package>-<variant>-<expect_version>`. First run downloads the whole
-archive; `actions/cache` saves it automatically at the end of the job. Later runs
-restore it and pass `--apk-file` so APKCombo is never contacted. There is no
-`use_cache` switch. If the runner IP is bot-blocked, pass `apk_url` to download
-from a direct link.
+## CI archive cache (automatic, per workflow)
+Each of `fetch-apk.yml`, `scan-libs.yml`, `decompile-lib.yml` runs:
+1. `actions/cache@v4` (id: cache) on `downloads/` keyed
+   `apk-v2-<package>-<variant>-<expect_version>` with restore-keys.
+2. A "Download the APK if the cache missed" step that runs only when
+   `steps.cache.outputs.cache-hit != 'true'` (or when `apk_url` is set).
+3. `actions/cache` saves `downloads/` automatically at job end (no manual save).
+4. On cache hit, the workflow passes `--apk-file <found>` to fetch_apk.py, so
+   APKCombo is never contacted. On miss, it downloads via `-p ... --mode download`
+   or `--apk-url`.
+The deprecated `download-apk.yml` stub is kept only for history; do not use it.
+
+## Pitfalls
+- The APKCombo "Blood Strike x DJ SNAKE" page serves **versionCode 17** (665.78 MB),
+  not the 1.003.650026/169 build installed on the device; its `libGame.so` is
+  72 MB (v7a) vs 84 MB on the device. Use `--expect-version` to refuse a build the
+  mirror has not published instead of silently comparing mismatched files.
+- `apkcombo/__init__.py` must not re-export a name that collides with a submodule
+  (`download` was exported as a function and shadowed `apkcombo.download`, which
+  broke `download.Progress`). It is exported as `download_file` now.
+- Ranged reads are fine for the zip index, never for judging a payload: CI
+  downloads the whole APK and reads members with `zipfile` (CRC-checked).
+- The APKCombo build can differ from the one installed on a device, so lib
+  comparisons must report a mismatch instead of failing the job.
+- Shell heredocs are blocked in this sandbox; use write_file for scripts.
+- `Elf.machine` is the numeric e_machine (40), not a name: use `elf.machine_name` / `machine_name(elf)` before handing it to capstone.
+- Ghidra headless needs `/tmp/ghidra-project` to exist; it aborts with
+  "Directory not found" otherwise.
+- Ghidra 12 runs Python scripts via PyGhidra; older releases use Jython. The
+  `@runtime` header tag should be PyGhidra for v12.
+- `actions/cache` is a JS action - do NOT call it from `run:` with `actions/cache restore`; use the action step with `id: cache` and read `steps.cache.outputs.cache-hit`.
+
 
 ## Pitfalls
 - The APKCombo "Blood Strike x DJ SNAKE" page serves **versionCode 17** (665.78 MB),

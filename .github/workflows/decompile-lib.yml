@@ -1,12 +1,5 @@
 name: Decompile a native lib
 
-# Downloads the whole archive, takes the chosen ABI's library out of it and turns
-# the entire library into an uploadable listing:
-#  * capstone (default) - every function disassembled into gzipped JSONL parts
-#  * ghidra             - headless Ghidra + decompiler, produces C
-#  * ida                - needs a self-hosted runner with a licensed IDA install
-# Download the artifact, then explore it with analysis/inspect_decompiled.py.
-
 on:
   workflow_dispatch:
     inputs:
@@ -15,7 +8,7 @@ on:
         required: true
         default: com.netease.newspike
       slug:
-        description: APKCombo slug (the part before the package in the URL)
+        description: APKCombo slug
         required: false
         default: blood-strike-x-dj-snake
       variant:
@@ -28,10 +21,10 @@ on:
         default: armeabi-v7a
       so_name:
         description: Library file name inside lib/<abi>/
-        required: false
+        required: true
         default: libGame.so
       engine:
-        description: capstone (fast) | ghidra (real C, slow) | ida (self-hosted only)
+        description: capstone | ghidra | ida
         required: true
         default: capstone
       expect_version:
@@ -39,7 +32,7 @@ on:
         required: false
         default: ""
       apk_url:
-        description: Direct archive URL; skips APKCombo scraping (use when the runner's IP is blocked)
+        description: Direct archive URL; skips APKCombo scraping (use when the runner IP is blocked)
         required: false
         default: ""
       max_functions:
@@ -51,55 +44,45 @@ on:
         required: false
         default: "0"
       split_mb:
-        description: Start a new JSONL part after this many uncompressed MiB
+        description: Split decompilation parts every N MB of code (0 = one part)
         required: false
-        default: "48"
+        default: "0"
       text_listing:
-        description: Also write a human-readable listing.txt (big)
+        description: Emit a plain text instruction listing alongside JSONL
         required: false
         default: "false"
-      retention_days:
-        description: Artifact retention
-        required: false
-        default: "7"
 
 permissions:
   contents: read
+
+concurrency:
+  group: decompile-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   decompile:
     runs-on: ubuntu-latest
     timeout-minutes: 330
+    env:
+      PYTHONUNBUFFERED: "1"
+      PACKAGE: ${{ inputs.package || 'com.netease.newspike' }}
+      SLUG: ${{ inputs.slug || 'blood-strike-x-dj-snake' }}
+      VARIANT: ${{ inputs.variant || 'apk' }}
+      ABI: ${{ inputs.abi || 'armeabi-v7a' }}
+      SO: ${{ inputs.so_name || 'libGame.so' }}
+      ENGINE: ${{ inputs.engine || 'capstone' }}
+      EXPECT_VERSION: ${{ inputs.expect_version || '' }}
+      APK_URL: ${{ inputs.apk_url || '' }}
+      MAX_FN: ${{ inputs.max_functions }}
+      MAX_INSN: ${{ inputs.max_instructions }}
+      SPLIT: ${{ inputs.split_mb }}
+      TEXT: ${{ inputs.text_listing }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Show inputs
-        env:
-          PKG: ${{ inputs.package }}
-          SLUG: ${{ inputs.slug }}
-          VARIANT: ${{ inputs.variant }}
-          ABI: ${{ inputs.abi }}
-          SO: ${{ inputs.so_name }}
-          ENGINE: ${{ inputs.engine }}
-        run: |
-          {
-            echo "### Request"
-            echo ""
-            echo "| input | value |"
-            echo "| --- | --- |"
-            echo "| package | \`$PKG\` |"
-            echo "| slug | \`$SLUG\` |"
-            echo "| variant | \`$VARIANT\` |"
-            echo "| ABI | \`$ABI\` |"
-            echo "| library | \`$SO\` |"
-            echo "| engine | \`$ENGINE\` |"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-          df -h / | tail -1
 
       - name: Install capstone
         if: inputs.engine == 'capstone'
@@ -124,61 +107,72 @@ jobs:
         run: python -m compileall -q apkcombo analysis fetch_apk.py
 
       - name: Restore the cached archive
+        id: cache
         uses: actions/cache@v4
         with:
           path: downloads
-          key: apk-v2-${{ inputs.package }}-${{ inputs.variant }}-${{ inputs.expect_version || 'any' }}
+          key: apk-v2-${{ inputs.package || 'com.netease.newspike' }}-${{ inputs.variant || 'apk' }}-${{ inputs.expect_version || 'any' }}
           restore-keys: |
-            apk-v2-${{ inputs.package }}-${{ inputs.variant }}-
+            apk-v2-${{ inputs.package || 'com.netease.newspike' }}-${{ inputs.variant || 'apk' }}-
 
-      - name: Resolve the archive
+      - name: Download the APK if the cache missed
+        shell: bash
         env:
-          PKG: ${{ inputs.package }}
-          SLUG: ${{ inputs.slug }}
-          VARIANT: ${{ inputs.variant }}
-          VERSION: ${{ inputs.expect_version }}
-          APK_URL: ${{ inputs.apk_url }}
-          ABI: ${{ inputs.abi }}
+          PKG: ${{ inputs.package || 'com.netease.newspike' }}
+          SLUG: ${{ inputs.slug || 'blood-strike-x-dj-snake' }}
+          VARIANT: ${{ inputs.variant || 'apk' }}
+          ABI: ${{ inputs.abi || 'armeabi-v7a' }}
+          SO: ${{ inputs.so_name || 'libGame.so' }}
+          ENGINE: ${{ inputs.engine || 'capstone' }}
+          EXPECT_VERSION: ${{ inputs.expect_version || '' }}
+          APK_URL: ${{ inputs.apk_url || '' }}
+          MAX_FN: ${{ inputs.max_functions }}
+          MAX_INSN: ${{ inputs.max_instructions }}
+          SPLIT: ${{ inputs.split_mb }}
+          TEXT: ${{ inputs.text_listing }}
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
         run: |
           set -o pipefail
-          existing=$(find downloads -maxdepth 1 \( -name '*.apk' -o -name '*.xapk' \) 2>/dev/null | head -1)
-          if [ -n "$existing" ]; then
-            echo "reusing the cached archive: $existing (APKCombo is not contacted)"
-            python fetch_apk.py --apk-file "$existing" --detect-abis --require-abi "$ABI"
-          elif [ -n "$APK_URL" ]; then
-            echo "downloading from a direct URL: $APK_URL"
-            python fetch_apk.py --apk-url "$APK_URL" --mode download --out-dir downloads \
-              --detect-abis --require-abi "$ABI"
+          if [ "$CACHE_HIT" = "true" ]; then
+            echo "Cache hit - the APK was restored, no download needed."
+            exit 0
+          fi
+          echo "Cache miss - downloading the APK."
+          if [ -n "$APK_URL" ]; then
+            args=( --apk-url "$APK_URL" --mode download --out-dir downloads )
           else
-            args=( -p "$PKG" --variant "$VARIANT" --mode download --out-dir downloads
-                   --detect-abis --require-abi "$ABI" )
-            [ -n "$SLUG" ] && args+=( --slug "$SLUG" )
-            [ -n "$VERSION" ] && args+=( --expect-version "$VERSION" )
-            set +e
-            python fetch_apk.py "${args[@]}" 2>&1 | tee resolve.log
-            status=${PIPESTATUS[0]}
-            if [ "$status" -eq 4 ]; then
-              echo "::error::APKCombo blocked this runner's IP (Cloudflare). Re-run with"
-              echo "::error::apk_url set to a direct archive link, or restore the cache."
+            args=( -p "$PKG" --slug "$SLUG" --variant "$VARIANT" --mode download --out-dir downloads )
+            [ -n "$EXPECT_VERSION" ] && args+=( --expect-version "$EXPECT_VERSION" )
+          fi
+          args+=( --detect-abis --require-abi "$ABI" )
+          echo "python fetch_apk.py ${args[*]}"
+          set +e
+          python fetch_apk.py "${args[@]}" 2>&1 | tee download.log
+          STATUS=${PIPESTATUS[0]}
+          if [ "$STATUS" -ne 0 ]; then
+            if [ "$STATUS" -eq 4 ]; then
+              echo "::error::APKCombo blocked this runner's IP (Cloudflare). Re-run with apk_url."
             fi
-            if [ "$status" -ne 0 ]; then
-              exit "$status"
-            fi
+            exit "$STATUS"
           fi
 
       - name: Locate the archive
         id: archive
         run: |
-          file=$(find downloads -maxdepth 1 -name '*.apk' -o -maxdepth 1 -name '*.xapk' | head -1)
-          if [ -z "$file" ]; then echo "no archive in downloads/"; exit 1; fi
-          echo "path=$file" >> "$GITHUB_OUTPUT"
-          sha256sum "$file" | tee downloads/SHA256SUMS.txt
+          FILE=$(find downloads -maxdepth 1 -type f \( -name '*.apk' -o -name '*.xapk' \) | head -n 1)
+          if [ -z "$FILE" ]; then
+            echo "::error::no .apk/.xapk in downloads/"
+            exit 1
+          fi
+          echo "path=$FILE" >> "$GITHUB_OUTPUT"
+          ls -l "$FILE"
+          sha256sum "$FILE" | tee downloads/SHA256SUMS.txt
 
       - name: Decompile with capstone
         if: inputs.engine == 'capstone'
         env:
-          ABI: ${{ inputs.abi }}
-          SO: ${{ inputs.so_name }}
+          ABI: ${{ inputs.abi || 'armeabi-v7a' }}
+          SO: ${{ inputs.so_name || 'libGame.so' }}
           MAX_FN: ${{ inputs.max_functions }}
           MAX_INSN: ${{ inputs.max_instructions }}
           SPLIT: ${{ inputs.split_mb }}
@@ -193,8 +187,8 @@ jobs:
       - name: Decompile with Ghidra
         if: inputs.engine == 'ghidra'
         env:
-          ABI: ${{ inputs.abi }}
-          SO: ${{ inputs.so_name }}
+          ABI: ${{ inputs.abi || 'armeabi-v7a' }}
+          SO: ${{ inputs.so_name || 'libGame.so' }}
           MAX_FN: ${{ inputs.max_functions }}
         run: |
           set -o pipefail
@@ -209,50 +203,34 @@ jobs:
             -scriptPath analysis/ghidra \
              -postScript DecompileAll.py /tmp/ghidra-out "${MAX_FN:-0}" 0 \
              -deleteProject -analysisTimeoutPerFile 0 2>&1 | tee decompile.log
-          mkdir -p decompiled
-          gzip -9 -c /tmp/ghidra-out/decompiled.c > decompiled/decompiled.c.gz
-          cp /tmp/ghidra-out/ghidra-manifest.json decompiled/
-          ls -l decompiled
 
       - name: Decompile with IDA Pro
         if: inputs.engine == 'ida'
+        env:
+          ABI: ${{ inputs.abi || 'armeabi-v7a' }}
+          SO: ${{ inputs.so_name || 'libGame.so' }}
+          MAX_FN: ${{ inputs.max_functions }}
         run: |
-          if ! command -v idat64 >/dev/null && ! command -v idat >/dev/null; then
-            echo "IDA is not on PATH. This engine needs a self-hosted runner with a"
-            echo "licensed IDA install (Hex-Rays ARM/ARM64). Use engine=capstone or"
-            echo "engine=ghidra on hosted runners."
-            exit 1
-          fi
           mkdir -p /tmp/ida-out decompiled /tmp/ida-lib
           python -c "import sys,zipfile; a=zipfile.ZipFile(sys.argv[1]); a.extract('lib/%s/%s' % (sys.argv[2], sys.argv[3]), '/tmp/ida-lib')" \
-            "${{ steps.archive.outputs.path }}" "${{ inputs.abi }}" "${{ inputs.so_name }}"
-          SO_PATH="/tmp/ida-lib/lib/${{ inputs.abi }}/${{ inputs.so_name }}"
+            "${{ steps.archive.outputs.path }}" "${{ inputs.abi || 'armeabi-v7a' }}" "${{ inputs.so_name || 'libGame.so' }}"
+          SO_PATH="/tmp/ida-lib/lib/${{ inputs.abi || 'armeabi-v7a' }}/${{ inputs.so_name || 'libGame.so' }}"
           idat64 -A -S"analysis/ida/decompile_all.py /tmp/ida-out ${{ inputs.max_functions }} 0" \
             "$SO_PATH" 2>&1 | tee decompile.log || \
           idat -A -S"analysis/ida/decompile_all.py /tmp/ida-out ${{ inputs.max_functions }} 0" \
             "$SO_PATH" 2>&1 | tee decompile.log
-          gzip -9 -c /tmp/ida-out/decompiled.c > decompiled/decompiled.c.gz
-          cp /tmp/ida-out/ida-manifest.json decompiled/
 
       - name: Summary
         if: always()
         run: |
           {
-            echo "## Decompilation"
+            echo "## Decompile"
             echo ""
-            if [ -f decompiled/manifest.json ]; then
-              python -c "import json;m=json.load(open('decompiled/manifest.json'));r=m['result'];print(f\"- engine: capstone {m['capstone']}\");print(f\"- input: \\\`{m['input']['label']}\\\` sha256 \\\`{m['input']['sha256']}\\\`\");print(f\"- functions: {r['functions_written']} / {r['function_candidates']} candidates\");print(f\"- instructions: {r['instructions']}\");print(f\"- output: {r['compressed_bytes']/(1<<20):.1f} MiB compressed in {len(r['parts'])} part(s)\");print(f\"- truncated functions: {r['truncated_functions']}\")"
-            fi
-            if [ -f decompiled/ghidra-manifest.json ]; then
-              python -c "import json;m=json.load(open('decompiled/ghidra-manifest.json'));print(f\"- engine: ghidra, {m['functions_written']}/{m['functions_in_program']} functions\");print(f\"- decompiled.c: {m['output_bytes']/(1<<20):.1f} MiB in {m['seconds']}s\")"
-            fi
-            if [ -f decompiled/ida-manifest.json ]; then
-              python -c "import json;m=json.load(open('decompiled/ida-manifest.json'));print(f\"- engine: ida, {m['functions_written']}/{m['functions_in_program']} functions\")"
-            fi
+            echo "Engine: \`${{ inputs.engine || 'capstone' }}\`"
+            echo "ABI: \`${{ inputs.abi || 'armeabi-v7a' }}\`"
+            echo "Library: \`${{ inputs.so_name || 'libGame.so' }}\`"
             echo ""
-            echo '```'
-            tail -n 12 decompile.log 2>/dev/null || true
-            echo '```'
+            echo "Outputs: \`decompiled/\`, \`decompile.log\`, \`reports/\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the decompilation
@@ -263,5 +241,6 @@ jobs:
           path: |
             decompiled/
             decompile.log
+            reports/
           if-no-files-found: warn
-          retention-days: ${{ inputs.retention_days }}
+          retention-days: 30
