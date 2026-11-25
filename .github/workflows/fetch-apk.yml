@@ -106,6 +106,15 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           df -h / | tail -1
 
+      - name: Restore the cached archive
+        if: inputs.use_cache != 'false'
+        uses: actions/cache@v4
+        with:
+          path: downloads
+          key: apk-${{ inputs.package }}-${{ inputs.variant }}-${{ inputs.expect_version || 'any' }}-v1
+          restore-keys: |
+            apk-${{ inputs.package }}-${{ inputs.variant }}-
+
       - name: Fetch the APK and verify its ABIs
         shell: bash
         env:
@@ -117,17 +126,32 @@ jobs:
           PAGE_SHA: ${{ inputs.verify_page_sha256 }}
           EXTRACT: ${{ inputs.extract_abi }}
           VERSION: ${{ inputs.expect_version }}
+          APK_URL: ${{ inputs.apk_url }}
         run: |
           set -o pipefail
-          args=( -p "$PKG" --variant "$VARIANT" --mode "$MODE" --out-dir downloads --detect-abis )
-          [ -n "$SLUG" ] && args+=( --slug "$SLUG" )
+          existing=$(find downloads -maxdepth 1 -type f \( -name '*.apk' -o -name '*.xapk' \) 2>/dev/null | head -1)
+          if [ -n "$existing" ]; then
+            echo "reusing the cached archive: $existing"
+            args=( --apk-file "$existing" )
+          elif [ -n "$APK_URL" ]; then
+            args=( --apk-url "$APK_URL" --mode download --out-dir downloads )
+          else
+            args=( -p "$PKG" --variant "$VARIANT" --mode "$MODE" --out-dir downloads )
+            [ -n "$SLUG" ] && args+=( --slug "$SLUG" )
+            [ -n "$VERSION" ] && args+=( --expect-version "$VERSION" )
+          fi
+          args+=( --detect-abis )
           [ -n "$ABIS" ] && args+=( --require-abi "$ABIS" )
-          [ -n "$VERSION" ] && args+=( --expect-version "$VERSION" )
           [ "$PAGE_SHA" = "true" ] && args+=( --use-page-sha256 )
           [ -n "$EXTRACT" ] && args+=( --extract-abi "$EXTRACT" )
           echo "\$ python fetch_apk.py ${args[*]}"
+          set +e
           python fetch_apk.py "${args[@]}" 2>&1 | tee fetch.log
           status=${PIPESTATUS[0]}
+          if [ "$status" -eq 4 ]; then
+            echo "::error::APKCombo blocked this runner's IP (Cloudflare). Re-run with"
+            echo "::error::apk_url set to a direct archive link, or keep a cache entry."
+          fi
           {
             echo "## fetch_apk.py said"
             echo ""

@@ -50,7 +50,7 @@ except ImportError:  # run as a plain script
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import scan_pyrun as sp  # type: ignore
 
-DEFAULT_MAX_INSTRUCTIONS = 20000
+DEFAULT_MAX_INSTRUCTIONS = 0
 DEFAULT_SPLIT_MB = 48
 APK_SUFFIXES = (".apk", ".xapk", ".apks", ".apkm")
 
@@ -241,7 +241,7 @@ def disassemble_function(
     lines: List[str] = []
     truncated = False
     for insn in cs.disasm(code, addr):
-        if len(instructions) >= max_instructions:
+        if max_instructions and len(instructions) >= max_instructions:
             truncated = True
             break
         text = f"{insn.mnemonic} {insn.op_str}".strip()
@@ -353,7 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-instructions",
         type=int,
         default=DEFAULT_MAX_INSTRUCTIONS,
-        help=f"per-function instruction cap (default {DEFAULT_MAX_INSTRUCTIONS})",
+        help="per-function instruction cap (0 = no cap)",
     )
     parser.add_argument(
         "--split-mb",

@@ -19,6 +19,7 @@
 #
 # @category BloodStrike
 # @runtime Jython
+# @runtime PyGhidra  (Ghidra 12 dropped Jython; this tag lets either build run it)
 
 import json
 import os

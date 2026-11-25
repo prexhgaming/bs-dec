@@ -38,14 +38,22 @@ on:
         description: Fail unless the page offers this version (empty = accept any)
         required: false
         default: ""
+      apk_url:
+        description: Direct archive URL; skips APKCombo scraping (use when the runner's IP is blocked)
+        required: false
+        default: ""
+      use_cache:
+        description: Restore the archive from an earlier run instead of downloading it again
+        required: false
+        default: "true"
       max_functions:
         description: Stop after N functions (0 = every candidate)
         required: false
         default: "0"
       max_instructions:
-        description: Per-function instruction cap
+        description: Per-function instruction cap (0 = no cap)
         required: false
-        default: "20000"
+        default: "0"
       split_mb:
         description: Start a new JSONL part after this many uncompressed MiB
         required: false
@@ -119,18 +127,47 @@ jobs:
       - name: Compile check
         run: python -m compileall -q apkcombo analysis fetch_apk.py
 
-      - name: Download the full archive
+      - name: Restore the cached archive
+        if: inputs.use_cache == 'true'
+        uses: actions/cache@v4
+        with:
+          path: downloads
+          key: apk-${{ inputs.package }}-${{ inputs.variant }}-${{ inputs.expect_version || 'any' }}-v1
+          restore-keys: |
+            apk-${{ inputs.package }}-${{ inputs.variant }}-
+
+      - name: Resolve the archive
         env:
           PKG: ${{ inputs.package }}
           SLUG: ${{ inputs.slug }}
           VARIANT: ${{ inputs.variant }}
           VERSION: ${{ inputs.expect_version }}
+          APK_URL: ${{ inputs.apk_url }}
+          ABI: ${{ inputs.abi }}
         run: |
           set -o pipefail
-          args=( -p "$PKG" --variant "$VARIANT" --mode download --out-dir downloads --detect-abis )
-          [ -n "$SLUG" ] && args+=( --slug "$SLUG" )
-          [ -n "$VERSION" ] && args+=( --expect-version "$VERSION" )
-          python fetch_apk.py "${args[@]}"
+          existing=$(find downloads -maxdepth 1 \( -name '*.apk' -o -name '*.xapk' \) 2>/dev/null | head -1)
+          if [ -n "$existing" ]; then
+            echo "reusing the cached archive: $existing (APKCombo is not contacted)"
+            python fetch_apk.py --apk-file "$existing" --detect-abis --require-abi "$ABI"
+          elif [ -n "$APK_URL" ]; then
+            echo "downloading from a direct URL: $APK_URL"
+            python fetch_apk.py --apk-url "$APK_URL" --mode download --out-dir downloads \
+              --detect-abis --require-abi "$ABI"
+          else
+            args=( -p "$PKG" --variant "$VARIANT" --mode download --out-dir downloads
+                   --detect-abis --require-abi "$ABI" )
+            [ -n "$SLUG" ] && args+=( --slug "$SLUG" )
+            [ -n "$VERSION" ] && args+=( --expect-version "$VERSION" )
+            if ! python fetch_apk.py "${args[@]}"; then
+              status=$?
+              if [ "$status" -eq 4 ]; then
+                echo "::error::APKCombo blocked this runner's IP (Cloudflare). Re-run with"
+                echo "::error::apk_url set to a direct archive link, or restore the cache."
+              fi
+              exit "$status"
+            fi
+          fi
 
       - name: Locate the archive
         id: archive
@@ -164,15 +201,17 @@ jobs:
           MAX_FN: ${{ inputs.max_functions }}
         run: |
           set -o pipefail
-          mkdir -p /tmp/ghidra-lib /tmp/ghidra-out
+          mkdir -p /tmp/ghidra-lib /tmp/ghidra-out /tmp/ghidra-project
           member=$(python -c "import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); want='lib/%s/%s' % (sys.argv[2], sys.argv[3]); print(want if want in z.namelist() else [n for n in z.namelist() if n.startswith('lib/%s/' % sys.argv[2]) and n.endswith('/'+sys.argv[3])][0])" "${{ steps.archive.outputs.path }}" "$ABI" "$SO")
           echo "extracting $member"
           python -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extract(sys.argv[2], '/tmp/ghidra-lib')" "${{ steps.archive.outputs.path }}" "$member"
+          # Ghidra 12 runs Python scripts through PyGhidra; older releases use Jython.
+          python -m pip install --no-cache-dir --quiet pyghidra 2>/dev/null || true
           "$GHIDRA_HOME/support/analyzeHeadless" /tmp/ghidra-project bloodstrike \
             -import "/tmp/ghidra-lib/$member" \
             -scriptPath analysis/ghidra \
-            -postScript DecompileAll.py /tmp/ghidra-out "${MAX_FN:-0}" 14400 \
-            -deleteProject -analysisTimeoutPerFile 10800 2>&1 | tee decompile.log
+             -postScript DecompileAll.py /tmp/ghidra-out "${MAX_FN:-0}" 0 \
+             -deleteProject -analysisTimeoutPerFile 0 2>&1 | tee decompile.log
           mkdir -p decompiled
           gzip -9 -c /tmp/ghidra-out/decompiled.c > decompiled/decompiled.c.gz
           cp /tmp/ghidra-out/ghidra-manifest.json decompiled/
@@ -191,9 +230,9 @@ jobs:
           python -c "import sys,zipfile; a=zipfile.ZipFile(sys.argv[1]); a.extract('lib/%s/%s' % (sys.argv[2], sys.argv[3]), '/tmp/ida-lib')" \
             "${{ steps.archive.outputs.path }}" "${{ inputs.abi }}" "${{ inputs.so_name }}"
           SO_PATH="/tmp/ida-lib/lib/${{ inputs.abi }}/${{ inputs.so_name }}"
-          idat64 -A -S"analysis/ida/decompile_all.py /tmp/ida-out ${{ inputs.max_functions }} 14400" \
+          idat64 -A -S"analysis/ida/decompile_all.py /tmp/ida-out ${{ inputs.max_functions }} 0" \
             "$SO_PATH" 2>&1 | tee decompile.log || \
-          idat -A -S"analysis/ida/decompile_all.py /tmp/ida-out ${{ inputs.max_functions }} 14400" \
+          idat -A -S"analysis/ida/decompile_all.py /tmp/ida-out ${{ inputs.max_functions }} 0" \
             "$SO_PATH" 2>&1 | tee decompile.log
           gzip -9 -c /tmp/ida-out/decompiled.c > decompiled/decompiled.c.gz
           cp /tmp/ida-out/ida-manifest.json decompiled/

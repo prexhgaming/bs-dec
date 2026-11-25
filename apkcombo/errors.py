@@ -34,6 +34,14 @@ class ScrapeError(ApkComboError):
     """A page did not contain what the tool needs (it changed, or it is not an app page)."""
 
 
+class BlockedError(ApkComboError):
+    """APKCombo answered with a bot wall (Cloudflare challenge or an IP block)."""
+
+
+class UsageError(ApkComboError):
+    """The command line is missing something or contradicts itself."""
+
+
 class AppNotFound(ApkComboError):
     """No APKCombo page was found for the requested package or slug."""
 
@@ -74,10 +82,12 @@ def describe_exception(exc: BaseException) -> str:
 
 
 def exit_code_for(exc: BaseException) -> int:
-    """Stable exit codes: 1 general, 2 usage/not found, 3 verification."""
+    """Stable exit codes: 1 general, 2 usage/not found, 3 verification, 4 blocked."""
     if isinstance(exc, VerificationError):
         return 3
-    if isinstance(exc, (AbiError, VariantNotFound, AppNotFound)):
+    if isinstance(exc, BlockedError):
+        return 4
+    if isinstance(exc, (AbiError, VariantNotFound, AppNotFound, UsageError)):
         return 2
     return 1
 

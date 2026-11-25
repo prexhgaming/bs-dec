@@ -42,6 +42,14 @@ on:
         description: Optional URL of a local .so to match functions against (empty to skip)
         required: false
         default: ""
+      apk_url:
+        description: Direct archive URL; skips APKCombo scraping (use when the runner's IP is blocked)
+        required: false
+        default: ""
+      use_cache:
+        description: Restore the archive from an earlier run instead of downloading it again
+        required: false
+        default: "true"
   push:
     branches: [main]
     paths:
@@ -67,6 +75,7 @@ jobs:
       REQUIRE_ABI: ${{ inputs.require_abi || '' }}
       EXPECT_VERSION: ${{ inputs.expect_version || '' }}
       MATCH_URL: ${{ inputs.match_url || '' }}
+      APK_URL: ${{ inputs.apk_url || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -89,18 +98,46 @@ jobs:
       - name: Compile check
         run: python -m compileall -q apkcombo analysis fetch_apk.py
 
-      - name: Download the full APK
+      - name: Restore the cached archive
+        if: inputs.use_cache != 'false'
+        uses: actions/cache@v4
+        with:
+          path: downloads
+          key: apk-${{ inputs.package || 'com.netease.newspike' }}-${{ inputs.variant || 'apk' }}-${{ inputs.expect_version || 'any' }}-v1
+          restore-keys: |
+            apk-${{ inputs.package || 'com.netease.newspike' }}-${{ inputs.variant || 'apk' }}-
+
+      - name: Resolve the archive
         run: |
           set -o pipefail
-          ARGS=(-p "$PACKAGE" --slug "$SLUG" --variant "$VARIANT" --mode download --out-dir downloads)
+          EXISTING=$(find downloads -maxdepth 1 -type f \( -name '*.apk' -o -name '*.xapk' \) 2>/dev/null | head -n 1)
+          ARGS=()
+          if [ -n "$EXISTING" ]; then
+            echo "reusing the cached archive: $EXISTING (APKCombo is not contacted)"
+            ARGS=(--apk-file "$EXISTING")
+          elif [ -n "$APK_URL" ]; then
+            echo "downloading from a direct URL: $APK_URL"
+            ARGS=(--apk-url "$APK_URL" --mode download --out-dir downloads)
+          else
+            ARGS=(-p "$PACKAGE" --slug "$SLUG" --variant "$VARIANT" --mode download --out-dir downloads)
+            if [ -n "$EXPECT_VERSION" ]; then
+              ARGS+=(--expect-version "$EXPECT_VERSION")
+            fi
+          fi
           if [ -n "$REQUIRE_ABI" ]; then
             ARGS+=(--detect-abis --require-abi "$REQUIRE_ABI")
           fi
-          if [ -n "$EXPECT_VERSION" ]; then
-            ARGS+=(--expect-version "$EXPECT_VERSION")
-          fi
           echo "python fetch_apk.py ${ARGS[*]}"
+          set +e
           python fetch_apk.py "${ARGS[@]}" 2>&1 | tee download.log
+          STATUS=${PIPESTATUS[0]}
+          if [ "$STATUS" -ne 0 ]; then
+            if [ "$STATUS" -eq 4 ]; then
+              echo "::error::APKCombo blocked this runner's IP (Cloudflare). Re-run with"
+              echo "::error::apk_url set to a direct archive link, or keep a cache entry."
+            fi
+            exit "$STATUS"
+          fi
 
       - name: Locate the archive
         id: archive

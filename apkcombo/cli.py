@@ -15,13 +15,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
+from urllib.parse import urlsplit
 
 from . import abis, api, download, http, pages
-from .errors import AbiError, ApkComboError, VerificationError, describe_exception, exit_code_for
+from .errors import (
+    AbiError,
+    ApkComboError,
+    UsageError,
+    VerificationError,
+    describe_exception,
+    exit_code_for,
+)
 from .zipindex import RemoteZip, local_file_reader
 
 EXIT_OK = 0
@@ -76,9 +85,20 @@ def build_parser() -> argparse.ArgumentParser:
             "  python fetch_apk.py -p com.netease.newspike --mode sample\n"
             "  python fetch_apk.py -p com.netease.newspike --mode download --require-abi arm64-v8a,armeabi-v7a\n"
             "  python fetch_apk.py -p com.netease.newspike --variant auto --extract-abi arm64-v8a --mode download\n"
+            "  python fetch_apk.py --apk-file downloads/app.apk --require-abi arm64-v8a  (no network)\n"
+            "  python fetch_apk.py --apk-url https://host/app.apk --require-abi arm64-v8a   (no scraping)\n"
         ),
     )
-    parser.add_argument("-p", "--package", required=True, help="application id, e.g. com.netease.newspike")
+    parser.add_argument("-p", "--package", help="application id, e.g. com.netease.newspike")
+    parser.add_argument(
+        "--apk-file",
+        help="use an archive already on disk and skip APKCombo entirely (no network lookup)",
+    )
+    parser.add_argument(
+        "--apk-url",
+        help="download from this direct URL and skip APKCombo entirely (no page scraping)",
+    )
+    parser.add_argument("--user-agent", help="override the browser User-Agent sent to APKCombo")
     parser.add_argument("--slug", help="APKCombo page slug (skips the search step), e.g. blood-strike-x-dj-snake")
     parser.add_argument(
         "--variant",
@@ -98,6 +118,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-abi", help="comma separated ABIs the archive must contain (fails if missing)")
     parser.add_argument("--extract-abi", help="after a download, also write the base + that ABI's splits")
     parser.add_argument("--expect-sha256", help="fail unless the downloaded file has this sha256")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="download again even when a matching file is already on disk",
+    )
     parser.add_argument(
         "--expect-version",
         help="fail unless the page offers this version (e.g. 169 or 1.003.650026)",
@@ -133,6 +158,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 def run(args, reporter: Reporter) -> int:
     started = time.monotonic()
     infos: Dict[str, object] = {}
+    http.set_user_agent(args.user_agent)
+    if args.user_agent:
+        reporter.note("using a custom User-Agent")
+
+    if args.apk_file:
+        return _run_local_file(args, reporter, infos, started)
+    if args.apk_url:
+        return _run_direct_url(args, reporter, infos, started)
+    if not args.package:
+        raise UsageError("either -p/--package, --apk-file or --apk-url is required")
 
     reporter.note(f"package {args.package}" + (f" (slug {args.slug})" if args.slug else ""))
     app = pages.fetch_app_info(
@@ -215,17 +250,99 @@ def run(args, reporter: Reporter) -> int:
         return _finish(infos, args, reporter, started)
 
     # --mode download
+    path = _download_remote(remote, args, reporter, infos, page_sha=app.sha256)
+    return _inspect_and_finish(path, args, reporter, infos, app, started)
+
+
+def _run_local_file(args, reporter: Reporter, infos: Dict, started: float) -> int:
+    """Work from an archive already on disk; APKCombo is never contacted."""
+    path = Path(args.apk_file).expanduser()
+    if not path.is_file():
+        raise UsageError(f"no such archive: {path}")
+    size = path.stat().st_size
+    digest = download.hash_file(path)
+    reporter.note(f"using the archive on disk, APKCombo is not contacted: {path}")
+    reporter.out(f"file: {path.name} — {http.human_size(size)}")
+    reporter.out(f"sha256 {digest}")
+    infos["source"] = {"kind": "local_file", "path": str(path)}
+    infos["file"] = {"filename": path.name, "size": size, "sha256": digest}
+    if args.expect_sha256 and args.expect_sha256.lower() != digest.lower():
+        raise VerificationError(
+            f"{path.name} has sha256 {digest}, but {args.expect_sha256} was expected"
+        )
+    with open(path, "rb") as handle:
+        if handle.read(4) != ZIP_MAGIC:
+            raise VerificationError(f"{path.name} does not start with 'PK' — it is not an APK/XAPK")
+    return _inspect_and_finish(path, args, reporter, infos, None, started)
+
+
+def _run_direct_url(args, reporter: Reporter, infos: Dict, started: float) -> int:
+    """Download from a direct link, skipping the page (and its bot wall) entirely."""
+    info, _head = http.probe(
+        args.apk_url, timeout=args.timeout, retries=args.retries, log=reporter.debug
+    )
+    name = info.filename or os.path.basename(urlsplit(args.apk_url).path) or "download.bin"
+    kind = "XAPK" if name.lower().endswith(".xapk") else "APK"
+    reporter.note(f"direct link, the APKCombo page is not scraped: {args.apk_url}")
+    variant = pages.Variant(kind=kind, token="", size_text=info.size_text, size_bytes=info.size)
+    remote = api.RemoteFile(
+        url=args.apk_url,
+        variant=variant,
+        filename=name,
+        size=info.size,
+        content_type=info.content_type,
+        accept_ranges=info.accept_ranges,
+    )
+    infos["source"] = {"kind": "direct_url", "url": args.apk_url}
+    infos["file"] = remote.as_dict()
+    reporter.out(f"file: {remote.filename} — {remote.size_text}")
+    path = _download_remote(remote, args, reporter, infos)
+    return _inspect_and_finish(path, args, reporter, infos, None, started)
+
+
+def _download_remote(
+    remote: api.RemoteFile,
+    args,
+    reporter: Reporter,
+    infos: Dict,
+    *,
+    page_sha: Optional[str] = None,
+) -> Path:
+    """Fetch the archive, or reuse the copy already on disk (a restored cache)."""
     out_dir = Path(args.out_dir).expanduser()
     destination = out_dir / http.sanitize_filename(remote.filename)
     expected_sha = args.expect_sha256
-    if not expected_sha and args.use_page_sha256 and app.sha256:
-        expected_sha = app.sha256
+    if not expected_sha and args.use_page_sha256 and page_sha:
+        expected_sha = page_sha
         reporter.note(f"verifying against the SHA-256 published on the page: {expected_sha[:16]}…")
-    if expected_sha and variant.kind.lower() == "xapk" and not args.expect_sha256:
+    if expected_sha and remote.variant.kind.lower() == "xapk" and not args.expect_sha256:
         reporter.err(
             "warning: the page's SHA-256 describes the page's main file; "
             "the XAPK may differ, so a mismatch is possible"
         )
+
+    if destination.is_file() and not args.force:
+        size = destination.stat().st_size
+        if remote.size is None or size == remote.size:
+            digest = download.hash_file(destination)
+            if not expected_sha or digest.lower() == expected_sha.lower():
+                reporter.out(
+                    f"reusing {destination.name} — {http.human_size(size)} already on disk "
+                    f"(sha256 {digest})"
+                )
+                infos["download"] = {
+                    "path": str(destination),
+                    "size": size,
+                    "sha256": digest,
+                    "reused": True,
+                }
+                return destination
+            reporter.note(f"{destination.name} is on disk but has the wrong sha256; downloading again")
+        else:
+            reporter.note(
+                f"{destination.name} is on disk with {http.human_size(size)}, "
+                f"expected {http.human_size(remote.size)}; downloading again"
+            )
 
     progress = download.Progress(total=remote.size, prefix="", stream=sys.stderr)
     result = download.download(
@@ -246,14 +363,18 @@ def run(args, reporter: Reporter) -> int:
         f"in {result.elapsed:.1f}s ({http.human_size(result.speed)}/s)"
     )
     reporter.out(f"sha256 {result.sha256}")
+    return result.path
 
-    report = _inspect_local(result.path, reporter)
+
+def _inspect_and_finish(
+    path: Path, args, reporter: Reporter, infos: Dict, app, started: float
+) -> int:
+    """Report the architectures inside ``path``, honour the gates, then finish."""
+    report = _inspect_local(path, reporter)
     infos["abis"] = report.as_dict()
     _report_abis(report, args, reporter, infos, app)
-
     if args.extract_abi:
-        _extract_abi(result.path, args, reporter, infos)
-
+        _extract_abi(path, args, reporter, infos)
     return _finish(infos, args, reporter, started)
 
 

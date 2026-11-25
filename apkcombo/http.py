@@ -25,7 +25,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from .errors import HttpError, NetworkError, describe_exception
+from .errors import BlockedError, HttpError, NetworkError, describe_exception
 
 #: APKCombo serves the same markup to any client, but the mobile agent is what the
 #: site itself uses for its download buttons, so keep it identical in one place.
@@ -33,6 +33,53 @@ BROWSER_UA = (
     "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 )
+
+#: Cloudflare fingerprints the header set, so send what a real Chrome sends.
+BROWSER_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+    "image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Ch-Ua": '"Chromium";v="120", "Not:A-Brand";v="99", "Google Chrome";v="120"',
+    "Sec-Ch-Ua-Mobile": "?1",
+    "Sec-Ch-Ua-Platform": '"Android"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+}
+
+#: Bodies served instead of the page when the client is considered a bot.
+CHALLENGE_MARKERS = (
+    b"just a moment",
+    b"__cf_chl",
+    b"cf-challenge",
+    b"cf-chl-",
+    b"attention required",
+    b"enable javascript and cookies",
+    b"ddos protection by",
+)
+
+_ua_override: Optional[str] = None
+
+
+def set_user_agent(value: Optional[str]) -> None:
+    """Override the browser agent for every later request (``--user-agent``)."""
+    global _ua_override
+    _ua_override = value or None
+
+
+def current_user_agent() -> str:
+    return _ua_override or BROWSER_UA
+
+
+def looks_like_challenge(body: bytes) -> bool:
+    """True when a response body is a bot wall rather than real content."""
+    probe = (body or b"")[:16384].lower()
+    return any(marker in probe for marker in CHALLENGE_MARKERS)
+
+
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_RETRIES = 4
 MAX_ERROR_BODY = 4096
@@ -59,13 +106,10 @@ def build_opener(*, follow_redirects: bool = True) -> urllib.request.OpenerDirec
 
 
 def request_headers(**extra: str) -> Dict[str, str]:
-    headers = {
-        "User-Agent": BROWSER_UA,
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        # Keep Content-Length truthful for ranged requests.
-        "Accept-Encoding": "identity",
-    }
+    headers = dict(BROWSER_HEADERS)
+    headers["User-Agent"] = current_user_agent()
+    # Keep Content-Length truthful for ranged requests.
+    headers["Accept-Encoding"] = "identity"
     for key, value in extra.items():
         if value is None:
             continue
@@ -132,10 +176,17 @@ def request(
                 return exc.code, _lower_headers(exc.headers), b""
             detail = ""
             try:
-                detail = exc.read(MAX_ERROR_BODY).decode("utf-8", "replace").strip()
+                raw = exc.read(MAX_ERROR_BODY)
             except Exception:  # noqa: BLE001 - the body is only for the message
-                detail = ""
-            detail = re.sub(r"\s+", " ", detail)[:200]
+                raw = b""
+            if exc.code in (403, 429, 503) and looks_like_challenge(raw):
+                raise BlockedError(
+                    f"APKCombo answered HTTP {exc.code} with a Cloudflare bot challenge for {url}; "
+                    "the IP is blocked (GitHub's hosted runners are frequently flagged). "
+                    "Point the workflow at a cached archive (--apk-file) or a direct link "
+                    "(--apk-url) instead of re-scraping the site."
+                ) from exc
+            detail = re.sub(r"\s+", " ", raw.decode("utf-8", "replace")).strip()[:200]
             raise HttpError(exc.code, url, detail) from exc
         except urllib.error.URLError as exc:
             raise NetworkError(f"cannot reach {url}: {exc.reason}") from exc
