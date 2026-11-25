@@ -332,6 +332,8 @@ class CodeScan:
     movw: List[Tuple[int, int, int]] = field(default_factory=list)   # (site, rd, imm16)
     movt: List[Tuple[int, int, int]] = field(default_factory=list)
     mode_cmps: List[Tuple[int, int, int]] = field(default_factory=list)  # (site, reg, mode)
+    sub_imm: List[Tuple[int, int, int, int]] = field(default_factory=list)  # (site, rd, rn, value)
+    cmp_small: List[Tuple[int, int, int]] = field(default_factory=list)  # (site, reg, imm8)
     pc_refs: List[Tuple[int, int]] = field(default_factory=list)     # (site, target)
     zeros: List[Tuple[int, int]] = field(default_factory=list)       # (site, reg)
     adrp: List[Tuple[int, int, int]] = field(default_factory=list)   # (site, rd, page)
@@ -358,7 +360,16 @@ def scan_code(elf: ELF, deep: bool = False) -> CodeScan:
     stages need (call sites, address materialisations, start-mode comparisons,
     register zeroing).  Kept in a single pass so we never revisit 52 MB of .text."""
     scan = CodeScan()
-    for vaddr, off, size, _name in elf.executable_ranges():
+    ranges = elf.executable_ranges()
+    pages = set()
+    for vaddr, _o, size, _n in ranges:
+        for page in range(vaddr >> 12, ((vaddr + size - 1) >> 12) + 1):
+            pages.add(page)
+
+    def in_exec(va: int) -> bool:
+        return (va >> 12) in pages
+
+    for vaddr, off, size, _name in ranges:
         data = bytes(elf.buf[off:off + size])
         words = _words_of(elf, data)
         base = vaddr
@@ -367,7 +378,9 @@ def scan_code(elf: ELF, deep: bool = False) -> CodeScan:
                 site = base + idx * 4
                 if (w & 0x0E000000) == 0x0A000000:                 # B / BL
                     imm = _sign(w & 0xFFFFFF, 24)
-                    scan.calls.append((site, site + 8 + (imm << 2)))
+                    target = site + 8 + (imm << 2)
+                    if in_exec(target):
+                        scan.calls.append((site, target))
                 elif (w & 0x0FF00000) == 0x03000000:               # MOVW
                     rd = (w >> 12) & 0xF
                     imm16 = (((w >> 16) & 0xF) << 12) | (w & 0xFFF)
@@ -413,21 +426,81 @@ def scan_code(elf: ELF, deep: bool = False) -> CodeScan:
                     rel = struct.unpack_from("<i", data, pos + 1)[0]
                     scan.calls.append((base + pos, base + pos + 5 + rel))
                 pos = data.find(b"\xe8", pos + 1)
-        if deep and elf.machine == EM_ARM:
-            _scan_thumb16(elf, data, base, scan)
+        if elf.machine == EM_ARM:
+            _scan_thumb2(elf, data, base, scan, keep_call=in_exec)
     return scan
 
 
-def _scan_thumb16(elf: ELF, data: bytes, base: int, scan: CodeScan) -> None:
-    """Thumb-16 ADR / MOVS-zero pass (2-byte aligned).  Thumb-2 32-bit forms are
-    covered by the 4-byte pass above when they happen to be 4-aligned."""
-    for pos in range(0, len(data) - 1, 2):
-        hw = data[pos] | (data[pos + 1] << 8)
+def thumb_expand_imm(imm12: int) -> int:
+    """ARM ThumbExpandImm: recover the constant that a 12-bit modified immediate
+    actually encodes.  Without this every ADR/CMP/SUB constant reads back wrong."""
+    if (imm12 >> 10) == 0:
+        byte = imm12 & 0xFF
+        mode = (imm12 >> 8) & 3
+        if mode == 0:
+            return byte
+        if mode == 1:
+            return (byte << 16) | byte
+        if mode == 2:
+            return (byte << 24) | (byte << 8)
+        return (byte << 24) | (byte << 16) | (byte << 8) | byte
+    unrotated = 0x80 | (imm12 & 0x7F)
+    rotation = (imm12 >> 7) & 0x1F
+    return ((unrotated >> rotation) | (unrotated << (32 - rotation))) & 0xFFFFFFFF
+
+
+def _scan_thumb2(elf: ELF, data: bytes, base: int, scan: CodeScan,
+                 keep_call=None) -> None:
+    """Thumb-2 (32-bit) pass.
+
+    Android armeabi-v7a code is overwhelmingly Thumb-2.  A linear ARM-mode sweep
+    over it decodes noise -- which is exactly why the ARM-only version reported
+    1.3M "branches" in libGame.so and never found a start-mode comparison."""
+    limit = len(data) - 3
+    for pos in range(0, limit, 2):
+        hw1 = data[pos] | (data[pos + 1] << 8)
         site = base + pos
-        if (hw & 0xF800) == 0xA000:                                # ADR Rd, #imm8
-            scan.pc_refs.append((site, ((site + 4) & ~3) + ((hw & 0xFF) << 2)))
-        elif (hw & 0xFF00) == 0x2000 and (hw & 0xFF) == 0:         # MOVS Rd, #0
-            scan.zeros.append((site, (hw >> 8) & 7))
+        if hw1 < 0xE800:                                           # 16-bit encoding
+            if (hw1 & 0xF800) == 0xA000:                           # ADR Rd, #imm8
+                scan.pc_refs.append((site, ((site + 4) & ~3) + ((hw1 & 0xFF) << 2)))
+            elif (hw1 & 0xF800) == 0x2800 and (hw1 & 0xFF) <= 8:   # CMP Rn, #imm8
+                scan.cmp_small.append((site, (hw1 >> 8) & 7, hw1 & 0xFF))
+            elif (hw1 & 0xF800) == 0x2000 and (hw1 & 0xFF) == 0:   # MOVS Rd, #0
+                scan.zeros.append((site, (hw1 >> 8) & 7))
+            continue
+
+        hw2 = data[pos + 2] | (data[pos + 3] << 8)
+        rd = (hw2 >> 8) & 0xF
+        imm3 = (hw2 >> 12) & 7
+        imm8 = hw2 & 0xFF
+        i = (hw1 >> 10) & 1
+        imm12 = (i << 11) | (imm3 << 8) | imm8
+        const = thumb_expand_imm(imm12)
+        op = hw1 & 0xFBF0
+
+        if op == 0xF240:                                           # MOVW
+            scan.movw.append((site, rd, ((hw1 & 0xF) << 12) | imm12))
+        elif op == 0xF2C0:                                         # MOVT
+            scan.movt.append((site, rd, ((hw1 & 0xF) << 12) | imm12))
+        elif op == 0xF1B0 and (hw2 & 0x0F00) == 0x0F00:            # CMP Rn, #const
+            scan.mode_cmps.append((site, hw1 & 0xF, const))
+        elif op == 0xF1A0:                                         # SUB Rd, Rn, #const
+            scan.sub_imm.append((site, rd, hw1 & 0xF, const))
+        elif (hw1 & 0xFFF0) == 0xF200 and (hw1 & 0xF) == 0xF:      # ADR.W Rd, #const
+            scan.pc_refs.append((site, ((site + 4) & ~3) + const))
+        elif op == 0xF040 and (hw1 & 0xF) == 0xF and imm12 == 0:   # MOV Rd, #0
+            scan.zeros.append((site, rd))
+        elif (hw1 & 0xF800) == 0xF000 and (hw2 & 0xD000) == 0xD000:  # BL
+            s = (hw1 >> 10) & 1
+            j1 = (hw2 >> 13) & 1
+            j2 = (hw2 >> 11) & 1
+            i1 = 1 - (j1 ^ s)
+            i2 = 1 - (j2 ^ s)
+            imm = ((s << 24) | (i1 << 23) | (i2 << 22)
+                   | ((hw1 & 0x3FF) << 12) | ((hw2 & 0x7FF) << 1))
+            target = site + 4 + _sign(imm, 25)
+            if keep_call is None or keep_call(target):
+                scan.calls.append((site, target))
 
 
 def collect_xrefs(elf: ELF, targets: Set[int], scan: CodeScan) -> List[Xref]:
@@ -592,18 +665,13 @@ def group_by_function(elf: ELF, xrefs: Sequence[Xref]) -> Dict[int, List[Xref]]:
     return grouped
 
 
-def identify(elf: ELF, anchors: Sequence[Anchor], xrefs: Sequence[Xref],
-             scan: CodeScan, deep: bool = False) -> Tuple[List[FunctionHit], List[FunctionHit]]:
+def identify(elf: ELF, anchor_by_va: Dict[int, Anchor], xrefs: Sequence[Xref],
+             scan: CodeScan) -> Tuple[List[FunctionHit], List[FunctionHit]]:
     """Return (runtime_functions, flag_entrypoints).
 
     runtime_functions are the recovered _PyRun_String / _PyRun_File bodies;
     flag_entrypoints are the callers that pass name == NULL, i.e. the function the
     game actually calls -- PyRun_StringFlags under whatever name it now has."""
-    anchor_by_va: Dict[int, Anchor] = {}
-    for anchor in anchors:
-        for va in anchor.vas:
-            anchor_by_va[va] = anchor
-
     grouped = group_by_function(elf, xrefs)
     runtime: List[FunctionHit] = []
 
@@ -623,25 +691,41 @@ def identify(elf: ELF, anchors: Sequence[Anchor], xrefs: Sequence[Xref],
         if hit.score:
             runtime.append(hit)
 
-    # check_start()'s switch is inlined into both _PyRun_String and _PyRun_File,
-    # so a function containing all three start tokens is a runtime candidate even
-    # if every string literal was obfuscated away.
-    cmps_by_fn: Dict[int, List[int]] = {}
-    for site, _reg, mode in scan.mode_cmps:
+    # check_start() cannot be three immediate compares: 257 and 258 are not
+    # encodable as Thumb-2 modified immediates.  Compilers emit a range check
+    # instead -- `sub rD, rN, #256 ; cmp rD, #2` -- or a lone `cmp rN, #256`.
+    switch_by_fn: Dict[int, List[str]] = {}
+
+    for site, reg, value in scan.mode_cmps:
+        if value != MODE_SINGLE:
+            continue
         fn = prologue_before(elf, site)
         if fn is not None:
-            cmps_by_fn.setdefault(fn, []).append(mode)
-    for fn, modes in cmps_by_fn.items():
-        if len(set(modes)) < 3:
+            switch_by_fn.setdefault(fn, []).append(f"cmp r{reg}, #256")
+
+    small_cmps: Dict[int, List[Tuple[int, int]]] = {}
+    for site, reg, imm in scan.cmp_small:
+        small_cmps.setdefault(reg, []).append((site, imm))
+    for site, rd, rn, value in scan.sub_imm:
+        if value != MODE_SINGLE:
             continue
-        existing = next((h for h in runtime if h.va == fn), None)
-        if existing is None:
-            existing = FunctionHit(fn, "_PyRun_String / _PyRun_File", 0)
-            runtime.append(existing)
-        existing.mode_cmps = sorted(set(modes))
-        existing.score += 25
-        existing.evidence.append(
-            "compares against all start tokens " + ", ".join(str(m) for m in sorted(set(modes))))
+        fn = prologue_before(elf, site)
+        if fn is None:
+            continue
+        for cmp_site, imm in small_cmps.get(rd, ()):
+            if 0 <= cmp_site - site <= 64 and imm in (2, 3):
+                switch_by_fn.setdefault(fn, []).append(
+                    f"sub r{rd}, r{rn}, #256 ; cmp r{rd}, #{imm}")
+                break
+
+    for fn, notes in switch_by_fn.items():
+        hit = next((h for h in runtime if h.va == fn), None)
+        if hit is None:
+            hit = FunctionHit(fn, "_PyRun_String / _PyRun_File", 0)
+            runtime.append(hit)
+        hit.score += 30
+        hit.mode_cmps = [MODE_SINGLE]
+        hit.evidence.extend(notes[:2])
 
     runtime.sort(key=lambda h: -h.score)
 
@@ -854,15 +938,32 @@ def main() -> int:
     log(f"[*] anchor literals resolved in {time.time() - started:.1f}s")
     markers = runtime_markers(elf)
 
-    targets: Set[int] = {va for anchor in anchors for va in anchor.vas}
+    anchor_by_va: Dict[int, Anchor] = {}
+    for anchor in anchors:
+        for va in anchor.vas:
+            anchor_by_va[va] = anchor
+
+    targets: Set[int] = set(anchor_by_va)
     scan = scan_code(elf, deep=args.deep)
     log(f"[*] decoded {len(scan.calls)} branches, {len(scan.movw)} movw, "
         f"{len(scan.movt)} movt in {time.time() - started:.1f}s")
 
     xrefs = collect_xrefs(elf, targets, scan)
-    log(f"[*] {len(xrefs)} cross-references to anchor literals")
+    log(f"[*] {len(xrefs)} direct cross-references to anchor literals")
 
-    runtime, entrypoints = identify(elf, anchors, xrefs, scan, deep=args.deep)
+    # Static PyObject strings (CPython's _Py_STR(anon_string) and friends) are
+    # reached indirectly: code -> a data slot -> the literal.  Resolve that second
+    # hop too, otherwise "<string>" looks unreferenced from any code.
+    proxies = {x.va: anchor_by_va[x.target] for x in xrefs
+               if x.target in anchor_by_va
+               and x.kind in ("data-pointer", "literal-pool")}
+    if proxies:
+        anchor_by_va.update(proxies)
+        second = collect_xrefs(elf, set(proxies), scan)
+        xrefs.extend(second)
+        log(f"[*] {len(second)} indirect cross-references via {len(proxies)} data slots")
+
+    runtime, entrypoints = identify(elf, anchor_by_va, xrefs, scan)
 
     verified: Dict[int, Optional[List[str]]] = {}
     if args.deep:
