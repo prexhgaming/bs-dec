@@ -6,7 +6,7 @@ run unchanged in GitHub Actions:
 ``pages``      parse the app and download pages (variants + POST tokens)
 ``api``        exchange a token for the signed transfer URL of the real file
 ``http``       urllib plumbing: retries, ranged reads, probing, small parsers
-``download``   resumable download with incremental SHA-256 and size checks
+``download``   streaming download with incremental SHA-256 and size checks
 ``zipindex``   read a remote archive's central directory over ranged requests
 ``abis``       work out which CPU architectures an archive contains
 ``cli``        probe / sample / download, ABI gating and split extraction
@@ -25,7 +25,8 @@ from .abis import (
     probe_abis,
 )
 from .api import RemoteFile, exchange_token, resolve_file, resolve_variant_file
-from .download import DownloadResult, Progress, download, hash_file
+from .download import DownloadResult, Progress, hash_file
+from .download import download as download_file
 from .errors import (
     AbiError,
     ApkComboError,
@@ -68,7 +69,7 @@ __all__ = [
     "__version__",
     "analyse_names",
     "describe_exception",
-    "download",
+    "download_file",
     "exchange_token",
     "exit_code_for",
     "fetch_app_info",

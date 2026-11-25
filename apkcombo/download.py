@@ -1,11 +1,10 @@
-"""Resumable download with incremental hashing.
+"""Streaming download with incremental hashing.
 
-The transfer host advertises ``Accept-Ranges: bytes``, so a 700 MB download that
-dies at 90% only costs the user the last 10%: everything is written to
-``<name>.part`` and the next attempt asks for the remaining byte range. The hash
-is computed while streaming, and the part file is only renamed into place after
-size and (optionally) SHA-256 check out — a corrupt transfer can never look like
-a finished file.
+The transfer host advertises ``Accept-Ranges: bytes``, but resuming is not worth
+the extra state here: a 700 MB pull on a runner finishes in well under a minute,
+so every attempt simply starts over. The hash is computed while the bytes stream
+in, and the file is only kept after size and (optionally) SHA-256 check out — a
+corrupt or truncated transfer can never look like a finished file.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from . import http
 from .errors import DownloadError, NetworkError, VerificationError, describe_exception
@@ -32,7 +31,6 @@ class DownloadResult:
     sha256: str
     url: str
     elapsed: float
-    resumed_from: int = 0
     already_present: bool = False
 
     @property
@@ -48,7 +46,6 @@ class DownloadResult:
             "sha256": self.sha256,
             "url": self.url,
             "elapsed_seconds": round(self.elapsed, 3),
-            "resumed_from": self.resumed_from,
             "already_present": self.already_present,
         }
 
@@ -66,7 +63,7 @@ def hash_file(path: os.PathLike) -> str:
 
 
 class Progress:
-    """Throttled progress line (percent, transferred, speed, ETA)."""
+    """Throttled progress line (percent, transferred, speed, elapsed/left)."""
 
     def __init__(
         self,
@@ -145,20 +142,22 @@ def download(
     *,
     expected_size: Optional[int] = None,
     expected_sha256: Optional[str] = None,
-    resume: bool = True,
     headers: Optional[Dict[str, str]] = None,
     timeout: float = 60.0,
     retries: int = 3,
     progress: Optional[Progress] = None,
     log: Optional[http.Log] = None,
 ) -> DownloadResult:
-    """Download ``url`` to ``dest``, resuming and verifying as described above."""
+    """Stream ``url`` into ``dest`` and verify the result.
+
+    An existing file that already matches is reused (handy on a CI re-run).
+    Failed attempts delete their partial file, so the next attempt starts clean.
+    """
     logger = log or (lambda _message: None)
     destination = Path(dest)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    part = destination.with_name(destination.name + ".part")
 
-    if destination.exists() and not part.exists():
+    if destination.exists():
         size = destination.stat().st_size
         digest = hash_file(destination) if expected_sha256 else ""
         if (expected_size is None or size == expected_size) and (
@@ -176,111 +175,77 @@ def download(
         logger(f"{destination.name} does not match the expected file, replacing it")
 
     started = time.monotonic()
-    resumed_from = 0
     last_error: Optional[BaseException] = None
+    attempts = max(retries, 1)
 
-    for attempt in range(1, max(retries, 1) + 1):
-        offset = part.stat().st_size if (resume and part.exists()) else 0
-        if offset and expected_size is not None and offset > expected_size:
-            logger(f"{part.name} is larger than expected, starting over")
-            offset = 0
-        if offset:
-            logger(f"resuming {destination.name} at {http.human_size(offset)}")
-        resumed_from = offset
+    for attempt in range(1, attempts + 1):
         try:
             size, digest = _transfer(
                 url,
-                part,
-                offset=offset,
-                expected_size=expected_size,
+                destination,
                 headers=headers,
                 timeout=timeout,
                 progress=progress,
                 log=log,
             )
+        except VerificationError:
+            _remove(destination)
+            raise
         except (NetworkError, DownloadError) as exc:
             last_error = exc
-            if attempt >= max(retries, 1):
+            _remove(destination)
+            if attempt >= attempts:
                 break
             wait = min(2.0 * attempt, 10.0)
             logger(f"transfer interrupted ({describe_exception(exc)}), retrying in {wait:.0f}s")
             time.sleep(wait)
             continue
-        except VerificationError:
-            _remove(part)
-            raise
 
         if expected_size is not None and size != expected_size:
-            _remove(part)
+            _remove(destination)
             raise VerificationError(
                 f"{destination.name} is {size} bytes, expected {expected_size} "
-                "(the transfer was truncated; run again to start over)"
+                "(the transfer was truncated)"
             )
         if expected_sha256 and digest != expected_sha256.lower():
-            _remove(part)
+            _remove(destination)
             raise VerificationError(
                 f"sha256 mismatch for {destination.name}: got {digest}, expected {expected_sha256.lower()}"
             )
-        os.replace(part, destination)
-        elapsed = time.monotonic() - started
         return DownloadResult(
             path=destination,
             size=size,
             sha256=digest,
             url=url,
-            elapsed=elapsed,
-            resumed_from=resumed_from,
+            elapsed=time.monotonic() - started,
         )
 
     assert last_error is not None
     raise DownloadError(
-        f"could not download {url} after {retries} attempt(s): {describe_exception(last_error)}"
+        f"could not download {url} after {attempts} attempt(s): {describe_exception(last_error)}"
     )
 
 
 def _transfer(
     url: str,
-    part: Path,
+    destination: Path,
     *,
-    offset: int,
-    expected_size: Optional[int],
     headers: Optional[Dict[str, str]],
     timeout: float,
     progress: Optional[Progress],
     log: Optional[http.Log],
 ) -> Tuple[int, str]:
     logger = log or (lambda _message: None)
-    byte_range = None
-    if offset:
-        byte_range = (offset, expected_size - 1 if expected_size else 1 << 62)
-
-    response = http.open_response(url, byte_range=byte_range, headers=headers, timeout=timeout)
+    response = http.open_response(url, headers=headers, timeout=timeout)
+    digest = hashlib.sha256()
+    written = 0
     try:
         status = getattr(response, "status", 200)
-        response_headers = {str(k).lower(): str(v) for k, v in dict(getattr(response, "headers", {})).items()}
-        if offset and status == 200:
-            # The server ignored the Range header: start from scratch.
-            logger("server ignored the range request, downloading from the beginning")
-            offset = 0
-        digest = hashlib.sha256()
-        mode = "r+b" if offset else "wb"
-        with open(part, mode) as handle:
-            if offset:
-                handle.seek(0)
-                remaining = offset
-                while remaining > 0:
-                    chunk = handle.read(min(HASH_CHUNK, remaining))
-                    if not chunk:
-                        break
-                    digest.update(chunk)
-                    remaining -= len(chunk)
-                handle.seek(offset)
-                handle.truncate(offset)
-            else:
-                handle.truncate(0)
-            if progress is not None:
-                progress.done = offset
-            written = offset
+        if status not in (200, 206):
+            raise DownloadError(f"unexpected HTTP {status} while downloading {url}")
+        if progress is not None:
+            progress.done = 0
+        with open(destination, "wb") as handle:
             for chunk in http.iter_chunks(response):
                 handle.write(chunk)
                 digest.update(chunk)
@@ -289,12 +254,15 @@ def _transfer(
                     progress.advance(len(chunk))
             handle.flush()
             os.fsync(handle.fileno())
-        return written, digest.hexdigest()
+    except OSError as exc:
+        raise DownloadError(f"could not write {destination}: {exc}") from exc
     finally:
         try:
             response.close()
         except Exception:  # noqa: BLE001 - closing must never mask the real error
             pass
+    logger(f"received {http.human_size(written)} into {destination.name}")
+    return written, digest.hexdigest()
 
 
 def _remove(path: Path) -> None:

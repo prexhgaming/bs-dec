@@ -24,8 +24,8 @@ APKCombo publishes a download page per app. The tool:
 2. Reads the remote zip central directory with HTTP range requests (a few KiB)
    to list `lib/<abi>/*.so` and `config.<abi>.apk` members — that is the
    authoritative source of which ABIs the file carries.
-3. Downloads with resume (`.part` files), hashes (sha256/sha1/md5), and gates
-   on `--require-abi` (exit code 3 on mismatch).
+3. Streams the file straight to disk while hashing it (sha256/sha1/md5), then
+   gates on `--require-abi` (exit code 3 on mismatch).
 
 `--detect-abis` prints the ABI report; `--use-page-sha256` also checks the
 file against the SHA-256 published on the APKCombo page.

@@ -7,7 +7,7 @@ The public flow, with no account and no captcha, is short:
 2. ``POST`` that token back to the same URL. The answer is a ``303`` whose
    ``Location`` is a Cloudflare-Worker URL, ``apkcombo-transfer…workers.dev/file/<opaque>``.
 3. ``GET`` that worker URL: it is the file itself (``Content-Disposition`` carries
-   the name, ``Accept-Ranges: bytes`` means it can be resumed and range-read).
+   the name, ``Accept-Ranges: bytes`` lets us range-read its zip index).
 
 Two things to remember: the token is single-use-ish and the worker URL is signed
 for a short window (the cookie APKCombo sets lives 30 minutes), so both must be

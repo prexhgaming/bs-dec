@@ -6,7 +6,7 @@ a few KiB of ranged reads:
 
 ``--mode probe``    resolve everything, download nothing but a 4 KiB header
 ``--mode sample``   pull the first few MiB to prove the bytes really flow
-``--mode download`` full resumable download, size check, SHA-256, ABI gate
+``--mode download`` full download, size check, SHA-256, ABI gate
 ``--detect-abis``   read the zip index over ranged requests and list the ABIs
 ``--extract-abi``   write only the base + that architecture's splits out of a bundle
 """
@@ -169,7 +169,7 @@ def run(args, reporter: Reporter) -> int:
     infos["file"] = remote.as_dict()
     reporter.out(
         f"file: {remote.filename} — {remote.size_text} "
-        f"({'resumable' if remote.accept_ranges else 'no range support'})"
+        f"({'range reads available' if remote.accept_ranges else 'no range support'})"
     )
 
     if args.mode == "probe":
