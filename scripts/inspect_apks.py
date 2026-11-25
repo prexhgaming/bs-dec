@@ -527,7 +527,11 @@ def main(argv=None) -> int:
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
             handle.write(markdown + "\n")
 
-    print(markdown)
+    if args.quiet:
+        verdict = "PASS" if report["ok"] else f"FAIL (missing {', '.join(report['missing'])})"
+        print(f"{verdict}: {report['apk_count']} APK(s) checked in {Path(report['source']).name}")
+    else:
+        print(markdown)
     print(f"reports: {json_path} and {md_path}", file=sys.stderr)
     log(f"finished in {time.monotonic() - started:.1f}s")
 

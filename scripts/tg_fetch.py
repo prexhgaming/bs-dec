@@ -29,7 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -55,6 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chat", help="chat id, @username or https://t.me/... link")
     parser.add_argument("--message", help="message id or full t.me message link")
     parser.add_argument("--file-id", help="Telegram file_id (skips message lookup)")
+    parser.add_argument(
+        "--parts",
+        help="split-archive mode: message ids of the parts, in order (e.g. 241-274 or 241,242,243). "
+        "Every part stays under the cloud API's 20 MB getFile limit, so this needs no api_id/api_hash.",
+    )
+    parser.add_argument("--sha256", help="expected sha256 of the assembled file (parts mode)")
+    parser.add_argument("--keep-parts", action="store_true", help="keep the downloaded part files")
     parser.add_argument("--url", help="download directly from this URL instead of Telegram")
     parser.add_argument(
         "--forward-to",
@@ -135,7 +142,9 @@ def main(argv=None) -> int:
                 return 1
             return 0
 
-        if args.url:
+        if args.parts:
+            record = fetch_parts(args, out_dir, log)
+        elif args.url:
             log(f"downloading directly from {args.url}")
             target, size, sha256, source = download_url(
                 args.url,
@@ -205,6 +214,145 @@ def main(argv=None) -> int:
 # ---------------------------------------------------------------------------
 # locating the file
 # ---------------------------------------------------------------------------
+
+
+def parse_parts(spec: str) -> List[int]:
+    """Parse ``241-274``, ``241,242`` or ``241 242`` into an ordered message-id list."""
+    raw = (spec or "").strip()
+    if not raw:
+        raise tg.TelegramError("--parts is empty: pass message ids, e.g. --parts 241-274")
+    ids: List[int] = []
+    for token in re.split(r"[,\s]+", raw):
+        if not token:
+            continue
+        span = re.fullmatch(r"(-?\d+)\s*-\s*(-?\d+)", token)
+        if span:
+            start, end = int(span.group(1)), int(span.group(2))
+            if end < start:
+                raise tg.TelegramError(f"invalid range {token!r}: the end is before the start")
+            if end - start > 5000:
+                raise tg.TelegramError(f"range {token!r} is too large (max 5000 parts)")
+            ids.extend(range(start, end + 1))
+            continue
+        if not re.fullmatch(r"-?\d+", token):
+            raise tg.TelegramError(f"invalid message id {token!r} in --parts")
+        ids.append(int(token))
+    if not ids:
+        raise tg.TelegramError("--parts contained no message ids")
+    return ids
+
+
+def _assembled_name(parts: List[Dict[str, object]]) -> Optional[str]:
+    """Guess the whole-file name from the first part (``001-bs.xapk.001`` -> ``bs.xapk``)."""
+    if not parts:
+        return None
+    name = re.sub(r"^\d{3}-", "", str(parts[0].get("name") or ""))
+    stripped = re.sub(r"\.(part\d{1,4}|\d{1,4})$", "", name, flags=re.I)
+    return stripped or name or None
+
+
+def _assemble(parts_dir: Path, names: List[str], dest: Path) -> Tuple[int, str]:
+    """Concatenate part files in order, hashing as we go (atomic via a .part file)."""
+    digest = hashlib.sha256()
+    size = 0
+    staging = dest.with_name(dest.name + ".part")
+    with open(staging, "wb") as out:
+        for name in names:
+            with open(parts_dir / name, "rb") as handle:
+                while True:
+                    chunk = handle.read(CHUNK)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+    os.replace(staging, dest)
+    return size, digest.hexdigest()
+
+
+def fetch_parts(args, out_dir: Path, log) -> Dict[str, object]:
+    """Download a split archive part by part and assemble it into a single file.
+
+    This is the no-``api_id`` route: a bot may download files up to 20 MB through
+    the ordinary cloud API, so the archive is sent as numbered parts and stitched
+    back together here.
+    """
+    chat, _ = tg.normalize_chat(args.chat or "")
+    message_ids = parse_parts(args.parts)
+    log(f"parts mode: {len(message_ids)} message(s) from chat {chat}")
+
+    parts_dir = out_dir / "parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    downloaded: List[Dict[str, object]] = []
+    total = 0
+    for index, message_id in enumerate(message_ids, start=1):
+        remote = lookup_message_file(chat, message_id, args, log)
+        if remote is None:
+            raise tg.TelegramError(f"message {message_id} carries no document to use as part {index}")
+        warning = tg.check_downloadable_size(remote.file_size, args.api_base)
+        if warning:
+            raise tg.TelegramError(
+                f"part {index} (message {message_id}) cannot be fetched through this Bot API: {warning}"
+            )
+        name = tg.sanitize_name(
+            remote.file_name or f"part{index:03d}", default=f"part{index:03d}"
+        )
+        dest = parts_dir / f"{index:03d}-{name}"
+        file_path = _resolve_file_path(remote.file_id, args)
+        url = tg.build_download_url(file_path, token=args.token, base=args.api_base)
+        path, size, sha256, _ = download_url(
+            url,
+            dest,
+            timeout=args.timeout,
+            retries=args.retries,
+            log=log,
+            expected_size=remote.file_size,
+            max_size=args.max_size,
+        )
+        downloaded.append(
+            {
+                "message_id": message_id,
+                "file_id": remote.file_id,
+                "name": path.name,
+                "size": size,
+                "sha256": sha256,
+            }
+        )
+        total += size
+        log(f"part {index}/{len(message_ids)}: {path.name} ({tg.describe_size(size)})")
+
+    dest_name = args.name or _assembled_name(downloaded) or DEFAULT_NAME
+    target = out_dir / tg.sanitize_name(dest_name)
+    log(f"assembling {len(downloaded)} part(s) into {target.name}")
+    size, sha256 = _assemble(parts_dir, [str(item["name"]) for item in downloaded], target)
+
+    if size != total:
+        raise tg.TelegramError(f"assembled file is {size} bytes but its parts total {total}")
+    if args.sha256 and args.sha256.strip().lower() != sha256:
+        # Don't leave a wrongly assembled file behind that looks like a success.
+        _cleanup(target)
+        raise tg.TelegramError(
+            f"sha256 mismatch: assembled {sha256}, expected {args.sha256.strip().lower()}"
+        )
+
+    if not args.keep_parts:
+        for item in downloaded:
+            _cleanup(parts_dir / str(item["name"]))
+        _cleanup_dir(parts_dir)
+
+    return _record(
+        target,
+        size,
+        sha256,
+        f"{len(downloaded)} chat parts",
+        {
+            "kind": "telegram-parts",
+            "chat_id": chat,
+            "part_count": len(downloaded),
+            "parts": downloaded,
+        },
+    )
 
 
 def _message_id_from(args, fallback=None):
@@ -421,6 +569,13 @@ def _progress(label: str, done: int, total: Optional[int], started: float, note)
 def _cleanup(path: Path) -> None:
     try:
         path.unlink()
+    except OSError:
+        pass
+
+
+def _cleanup_dir(path: Path) -> None:
+    try:
+        path.rmdir()
     except OSError:
         pass
 

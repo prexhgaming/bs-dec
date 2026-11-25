@@ -248,10 +248,11 @@ class MessageLookupTests(unittest.TestCase):
 
 class _Handler(http.server.BaseHTTPRequestHandler):
     payload = b""
+    routes = {}
     truncate = False
 
     def do_GET(self):  # noqa: N802
-        body = self.payload
+        body = _Handler.routes.get(self.path, _Handler.payload)
         if _Handler.truncate:
             body = body[:-10]
         self.send_response(200)
@@ -270,6 +271,7 @@ class DownloadTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _Handler.payload = cls.payload
+        _Handler.routes = {}
         _Handler.truncate = False
         cls.server = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -342,6 +344,172 @@ class DownloadTests(unittest.TestCase):
         finally:
             if old is not None:
                 os.environ["GITHUB_OUTPUT"] = old
+
+
+# ---------------------------------------------------------------------------
+# split archives (no api_id needed: every part stays under the 20 MB limit)
+# ---------------------------------------------------------------------------
+
+
+class PartsParsingTests(unittest.TestCase):
+    def test_range(self):
+        self.assertEqual(tg_fetch.parse_parts("241-244"), [241, 242, 243, 244])
+
+    def test_single_id(self):
+        self.assertEqual(tg_fetch.parse_parts("241"), [241])
+
+    def test_lists_and_spaces(self):
+        self.assertEqual(tg_fetch.parse_parts("241,242,243"), [241, 242, 243])
+        self.assertEqual(tg_fetch.parse_parts("241 242  243"), [241, 242, 243])
+        self.assertEqual(tg_fetch.parse_parts("241, 242-243"), [241, 242, 243])
+
+    def test_reversed_range(self):
+        with self.assertRaises(tg.TelegramError):
+            tg_fetch.parse_parts("244-241")
+
+    def test_absurd_range(self):
+        with self.assertRaises(tg.TelegramError):
+            tg_fetch.parse_parts("1-999999")
+
+    def test_garbage(self):
+        with self.assertRaises(tg.TelegramError):
+            tg_fetch.parse_parts("part-one")
+
+    def test_empty(self):
+        with self.assertRaises(tg.TelegramError):
+            tg_fetch.parse_parts("  ")
+
+    def test_assembled_name(self):
+        self.assertEqual(
+            tg_fetch._assembled_name([{"name": "001-bloodstrike.xapk.001"}]), "bloodstrike.xapk"
+        )
+        self.assertEqual(
+            tg_fetch._assembled_name([{"name": "bloodstrike.zip.part03"}]), "bloodstrike.zip"
+        )
+        self.assertIsNone(tg_fetch._assembled_name([]))
+
+
+class PartsDownloadTests(unittest.TestCase):
+    """Three parts in, one file out — driven through the real download path."""
+
+    bodies = {
+        "/file/bot123:abc/documents/p241": b"A" * 4096,
+        "/file/bot123:abc/documents/p242": b"B" * 4096,
+        "/file/bot123:abc/documents/p243": b"C" * 4096,
+    }
+    expected = bodies[
+        "/file/bot123:abc/documents/p241"
+    ] + bodies["/file/bot123:abc/documents/p242"] + bodies["/file/bot123:abc/documents/p243"]
+
+    @classmethod
+    def setUpClass(cls):
+        _Handler.payload = b"unused"
+        _Handler.routes = dict(cls.bodies)
+        _Handler.truncate = False
+        cls.server = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = Path(self.tmp.name)
+        self.calls = []
+
+    def _fake_call(self, method, params=None, **kwargs):
+        params = params or {}
+        self.calls.append(method)
+        if method == "forwardMessage":
+            message_id = params["message_id"]
+            file_id = f"p{message_id}"
+            return {
+                "message_id": message_id + 100,
+                "chat": {"id": 9117250551},
+                "document": {
+                    "file_id": file_id,
+                    "file_unique_id": f"u{message_id}",
+                    "file_name": f"bloodstrike.xapk.{message_id - 240:03d}",
+                    "file_size": len(self.bodies[f"/file/bot123:abc/documents/{file_id}"]),
+                },
+            }
+        if method == "getFile":
+            return {"file_path": f"documents/{params['file_id']}"}
+        if method == "deleteMessage":
+            return True
+        raise AssertionError(f"unexpected API call {method}")
+
+    def test_parts_are_assembled_in_order(self):
+        argv = ["--chat", "9117250551", "--parts", "241-243", "--token", "123:abc",
+                "--api-base", self.base, "--out-dir", str(self.out), "--quiet"]
+        with mock.patch.object(tg, "call", side_effect=self._fake_call):
+            code = tg_fetch.main(argv)
+        self.assertEqual(code, 0)
+
+        assembled = self.out / "bloodstrike.xapk"
+        self.assertTrue(assembled.is_file())
+        self.assertEqual(assembled.read_bytes(), self.expected)
+        self.assertEqual(
+            hashlib.sha256(self.expected).hexdigest(),
+            hashlib.sha256(assembled.read_bytes()).hexdigest(),
+        )
+
+        record = json.loads((self.out / "fetch.json").read_text())
+        self.assertEqual(record["source"]["kind"], "telegram-parts")
+        self.assertEqual(record["source"]["part_count"], 3)
+        self.assertEqual(record["size"], len(self.expected))
+        self.assertEqual([part["message_id"] for part in record["source"]["parts"]], [241, 242, 243])
+
+        # parts are cleaned up, and their forwards were deleted
+        self.assertFalse((self.out / "parts").exists())
+        self.assertIn("deleteMessage", self.calls)
+
+    def test_sha256_mismatch_fails_and_leaves_no_file(self):
+        argv = ["--chat", "9117250551", "--parts", "241-243", "--token", "123:abc",
+                "--api-base", self.base, "--out-dir", str(self.out), "--quiet",
+                "--sha256", "0" * 64]
+        with mock.patch.object(tg, "call", side_effect=self._fake_call):
+            code = tg_fetch.main(argv)
+        self.assertEqual(code, 1)
+        self.assertFalse((self.out / "bloodstrike.xapk").exists())
+
+    def test_sha256_match_is_accepted(self):
+        argv = ["--chat", "9117250551", "--parts", "241-243", "--token", "123:abc",
+                "--api-base", self.base, "--out-dir", str(self.out), "--quiet",
+                "--sha256", hashlib.sha256(self.expected).hexdigest()]
+        with mock.patch.object(tg, "call", side_effect=self._fake_call):
+            self.assertEqual(tg_fetch.main(argv), 0)
+
+    def test_keep_parts_leaves_them_on_disk(self):
+        argv = ["--chat", "9117250551", "--parts", "241-243", "--token", "123:abc",
+                "--api-base", self.base, "--out-dir", str(self.out), "--quiet", "--keep-parts"]
+        with mock.patch.object(tg, "call", side_effect=self._fake_call):
+            self.assertEqual(tg_fetch.main(argv), 0)
+        self.assertEqual(len(list((self.out / "parts").glob("*"))), 3)
+
+    def test_a_part_over_the_cloud_limit_is_refused_before_downloading(self):
+        def huge_call(method, params=None, **kwargs):
+            if method == "forwardMessage":
+                return {
+                    "message_id": 999,
+                    "chat": {"id": 9117250551},
+                    "document": {
+                        "file_id": "huge",
+                        "file_name": "bloodstrike.xapk.001",
+                        "file_size": 300_000_000,
+                    },
+                }
+            return True
+
+        argv = ["--chat", "9117250551", "--parts", "241", "--token", "123:abc",
+                "--out-dir", str(self.out), "--quiet"]
+        with mock.patch.object(tg, "call", side_effect=huge_call):
+            self.assertEqual(tg_fetch.main(argv), 1)
 
 
 # ---------------------------------------------------------------------------
