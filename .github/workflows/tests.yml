@@ -1,0 +1,35 @@
+name: Tests
+
+# Offline unit tests: no network, no Telegram, no APKPure. They build a small
+# synthetic XAPK in a temp directory and check that the unpacker/ABI verifier
+# behaves (both ABIs present -> exit 0, missing ABI -> exit 1).
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile everything
+        run: python -m compileall -q scripts tests
+
+      - name: Run the tests
+        run: python -m unittest discover -s tests -v

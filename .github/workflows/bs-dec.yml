@@ -1,0 +1,280 @@
+name: Blood Strike ABI check
+
+# Downloads the Blood Strike archive straight out of a Telegram chat, unpacks
+# it, and fails the run unless the expected ABIs (64-bit arm64-v8a and 32-bit
+# armeabi-v7a by default) are really present inside the APKs.
+#
+# Telegram's *cloud* Bot API refuses getFile for files over ~20 MB, and the
+# archive is ~640 MB, so this workflow starts a self-hosted Bot API server
+# (aiogram/telegram-bot-api with TELEGRAM_LOCAL=1, limit 2000 MB) and points the
+# scripts at it. That server needs TELEGRAM_API_ID / TELEGRAM_API_HASH secrets
+# from https://my.telegram.org; without them the run falls back to the cloud API
+# and stops with a clear message instead of a mysterious HTTP 400.
+
+on:
+  workflow_dispatch:
+    inputs:
+      chat:
+        description: "Telegram chat: numeric id, @username, or a t.me link"
+        required: true
+        type: string
+        default: "9117250551"
+      message:
+        description: "Message id of the archive in that chat (forwarded to read its file_id)"
+        required: false
+        type: string
+        default: "236"
+      file_id:
+        description: "Telegram file_id — optional, skips the message lookup"
+        required: false
+        type: string
+        default: ""
+      url:
+        description: "Direct download URL — optional, bypasses Telegram entirely"
+        required: false
+        type: string
+        default: ""
+      require:
+        description: "ABIs that must be present (comma separated)"
+        required: false
+        type: string
+        default: "arm64-v8a,armeabi-v7a"
+      max_depth:
+        description: "How deep to unpack nested archives"
+        required: false
+        type: string
+        default: "3"
+      skip_asset_packs:
+        description: "Skip *_mpk / asset-pack APKs (big, no native code)"
+        required: false
+        type: boolean
+        default: true
+      list_only:
+        description: "Only list the archives the bot can see in the chat, then stop"
+        required: false
+        type: boolean
+        default: false
+      notify:
+        description: "Send the result back to the chat"
+        required: false
+        type: boolean
+        default: false
+      upload_apks:
+        description: "Upload the extracted APKs as an artifact"
+        required: false
+        type: boolean
+        default: true
+      retention_days:
+        description: "Artifact retention in days"
+        required: false
+        type: string
+        default: "7"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bs-dec-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  TELEGRAM_API_BASE: ""
+
+jobs:
+  unpack:
+    name: Fetch, unpack and verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Free up disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Show inputs
+        env:
+          INPUT_CHAT: ${{ inputs.chat }}
+          INPUT_MESSAGE: ${{ inputs.message }}
+          INPUT_FILE_ID: ${{ inputs.file_id }}
+          INPUT_URL: ${{ inputs.url }}
+          INPUT_REQUIRE: ${{ inputs.require }}
+        run: |
+          echo "chat:     ${INPUT_CHAT}"
+          echo "message:  ${INPUT_MESSAGE:-<none>}"
+          echo "file_id:  ${INPUT_FILE_ID:+<set>}"
+          echo "url:      ${INPUT_URL:-<telegram>}"
+          echo "require:  ${INPUT_REQUIRE}"
+          echo "list_only: ${{ inputs.list_only }}"
+
+      - name: Check the bot token secret
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          if [ -z "${TOKEN}" ]; then
+            echo "::error::Repository secret TELEGRAM_BOT_TOKEN is not set. Add it under Settings -> Secrets and variables -> Actions, then re-run this job."
+            exit 1
+          fi
+          echo "bot token present (${#TOKEN} characters)"
+
+      - name: Start a self-hosted Bot API server (files over 20 MB)
+        id: api
+        env:
+          TG_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TG_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TG_API_ID}" ] || [ -z "${TG_API_HASH}" ]; then
+            echo "::warning::TELEGRAM_API_ID / TELEGRAM_API_HASH are not set, so the cloud Bot API is used and it will refuse any file over ~20 MB. Add both secrets (api_id + api_hash from https://my.telegram.org) to download the real archive."
+            exit 0
+          fi
+          docker run -d --name tg-bot-api \
+            -p 127.0.0.1:8081:8081 \
+            -e TELEGRAM_API_ID -e TELEGRAM_API_HASH \
+            -e TELEGRAM_LOCAL=1 \
+            -e TELEGRAM_VERBOSITY=1 \
+            -v /tmp/tg-bot-api:/var/lib/telegram-bot-api \
+            aiogram/telegram-bot-api:latest
+          for _ in $(seq 1 45); do
+            if curl -sf -o /dev/null "http://127.0.0.1:8081/"; then break; fi
+            sleep 2
+          done
+          curl -sf -o /dev/null "http://127.0.0.1:8081/" || { echo "::error::the local Bot API server did not come up"; docker logs tg-bot-api | tail -40; exit 1; }
+          echo "base=http://127.0.0.1:8081" >> "$GITHUB_OUTPUT"
+          echo "local Bot API server is up on http://127.0.0.1:8081 (local mode, limit 2000 MB)"
+
+      - name: List the archives in the chat
+        if: inputs.list_only
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_API_BASE: ${{ steps.api.outputs.base }}
+        run: |
+          set -euo pipefail
+          python scripts/tg_fetch.py \
+            --chat "${{ inputs.chat }}" \
+            --list-only --scan-pages 10 --require-suffix .xapk,.zip,.apk,.7z,.rar | tee work-list.txt || true
+          {
+            echo "## Archives visible in the chat"
+            echo '```'
+            cat work-list.txt 2>/dev/null || echo "(nothing listed)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download the archive from Telegram
+        id: fetch
+        if: ${{ !inputs.list_only }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_API_BASE: ${{ steps.api.outputs.base }}
+          INPUT_CHAT: ${{ inputs.chat }}
+          INPUT_MESSAGE: ${{ inputs.message }}
+          INPUT_FILE_ID: ${{ inputs.file_id }}
+          INPUT_URL: ${{ inputs.url }}
+        run: |
+          set -euo pipefail
+          args=(--out-dir work --retries 5 --scan-pages 10 --timeout 300 --require-suffix .xapk,.zip,.apk)
+          if [ -n "${INPUT_URL:-}" ]; then
+            args+=(--url "${INPUT_URL}")
+          elif [ -n "${INPUT_FILE_ID:-}" ]; then
+            args+=(--chat "${INPUT_CHAT}" --file-id "${INPUT_FILE_ID}")
+          else
+            args+=(--chat "${INPUT_CHAT}")
+            if [ -n "${INPUT_MESSAGE:-}" ]; then args+=(--message "${INPUT_MESSAGE}"); fi
+          fi
+          python scripts/tg_fetch.py "${args[@]}"
+
+      - name: Unpack and verify the ABIs
+        id: verify
+        if: ${{ !inputs.list_only }}
+        continue-on-error: true
+        env:
+          ARCHIVE: ${{ steps.fetch.outputs.archive_path }}
+          INPUT_REQUIRE: ${{ inputs.require }}
+          INPUT_DEPTH: ${{ inputs.max_depth }}
+        run: |
+          set -euo pipefail
+          echo "archive: ${ARCHIVE} (${{ steps.fetch.outputs.archive_size }} bytes, sha256 ${{ steps.fetch.outputs.sha256 }})"
+          args=("${ARCHIVE}" --out-dir work/unpacked --require "${INPUT_REQUIRE}" --max-depth "${INPUT_DEPTH}"
+                --report-dir work/report --markdown-out work/report/abi_report.md --github-summary --keep-extracted)
+          if [ "${{ inputs.skip_asset_packs }}" = "true" ]; then args+=(--skip-asset-packs); fi
+          python scripts/inspect_apks.py "${args[@]}"
+
+      - name: Write the verdict summary
+        if: always() && !inputs.list_only
+        run: |
+          {
+            echo "## Result"
+            echo "- archive: \`${{ steps.fetch.outputs.archive_name }}\` (${{ steps.fetch.outputs.archive_size }} bytes)"
+            echo "- abi check: \`${{ steps.verify.outputs.ok }}\`"
+            echo "- missing: \`${{ steps.verify.outputs.missing }}\`"
+            echo "- APKs found: ${{ steps.verify.outputs.apk_count }}"
+            echo "- extracted APK artifact: \`bloodstrike-apks-run-${{ github.run_number }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the ABI report
+        if: always() && !inputs.list_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: abi-report-run-${{ github.run_number }}
+          path: work/report/*
+          if-no-files-found: warn
+          retention-days: ${{ fromJSON(inputs.retention_days) }}
+
+      - name: Upload the extracted APKs
+        if: always() && !inputs.list_only && inputs.upload_apks == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: bloodstrike-apks-run-${{ github.run_number }}
+          path: work/unpacked/**/*.apk
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: ${{ fromJSON(inputs.retention_days) }}
+
+      - name: Report back to the chat
+        if: always() && !inputs.list_only && inputs.notify == true
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_API_BASE: ${{ steps.api.outputs.base }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          INPUT_CHAT: ${{ inputs.chat }}
+          ARCHIVE_NAME: ${{ steps.fetch.outputs.archive_name }}
+        run: |
+          set -euo pipefail
+          if [ -f work/report/abi_report.json ]; then
+            python scripts/tg_notify.py \
+              --chat "${INPUT_CHAT}" \
+              --from-report work/report/abi_report.json \
+              --document work/report/abi_report.md \
+              --caption "Blood Strike ABI report (${ARCHIVE_NAME:-archive})"
+          else
+            python scripts/tg_notify.py \
+              --chat "${INPUT_CHAT}" \
+              --text "Blood Strike run #${{ github.run_number }} stopped before the ABI check — see the run log."
+          fi
+
+      - name: Bot API server log (on failure)
+        if: failure() && steps.api.outputs.base != ''
+        run: docker logs tg-bot-api 2>&1 | tail -40
+
+      - name: Fail when a required ABI is missing
+        if: ${{ !inputs.list_only && (steps.fetch.outcome == 'failure' || steps.verify.outcome == 'failure') }}
+        run: |
+          if [ "${{ steps.verify.outcome }}" = "failure" ]; then
+            echo "::error::ABI verification failed — see the ABI report in the job summary. Missing: ${{ steps.verify.outputs.missing }}"
+          else
+            echo "::error::The archive could not be fetched — see the fetch step log above."
+          fi
+          exit 1

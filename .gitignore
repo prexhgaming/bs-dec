@@ -1,0 +1,17 @@
+# working directories produced by the scripts
+work/
+work-*/
+tmp/
+downloads/
+*.part
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/
