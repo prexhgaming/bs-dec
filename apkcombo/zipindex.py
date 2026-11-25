@@ -281,14 +281,29 @@ class RemoteZip:
                     written += len(chunk)
                     position = stop + 1
         elif entry.is_deflated:
-            raw = self.read(entry)
-            payload = raw
-            logger(f"inflating {entry.name} ({http.human_size(len(raw))} compressed)")
             with open(destination, "wb") as handle:
-                handle.write(payload)
-            digest.update(payload)
-            crc = zlib.crc32(payload, crc)
-            written = len(payload)
+                inflater = zlib.decompressobj(-15)
+                position = start
+                end = start + entry.compressed_size - 1
+                while position <= end:
+                    stop = min(position + EXTRACT_CHUNK - 1, end)
+                    chunk = self._read(position, stop)
+                    position = stop + 1
+                    for piece in (inflater.decompress(chunk), b""):
+                        if not piece:
+                            continue
+                        handle.write(piece)
+                        digest.update(piece)
+                        crc = zlib.crc32(piece, crc)
+                        written += len(piece)
+                tail = inflater.flush()
+                if tail:
+                    handle.write(tail)
+                    digest.update(tail)
+                    crc = zlib.crc32(tail, crc)
+                    written += len(tail)
+            logger(f"inflated {entry.name} ({http.human_size(written)} from "
+                   f"{http.human_size(entry.compressed_size)})")
         else:
             raise ZipIndexError(f"unsupported compression method {entry.method} for {entry.name}")
 
